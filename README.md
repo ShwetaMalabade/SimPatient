@@ -20,7 +20,7 @@ This project simulates real-world doctor–patient consultations using AI. The c
 
 👥 Contributors
 
-Harsha Kantamaneni – Software Engineer (Wells Fargo)
-Mohan Askani - Data Scientist (Uber)
-Sweta Malabade - Software Engineer (UBS)
-Naveen Korrapati - Data Engineer (Deloitte)
+- Harsha Kantamaneni – Software Engineer (Wells Fargo)
+- Mohan Askani - Data Scientist (Uber)
+- Shweta Malabade - Software Engineer (UBS)
+- Naveen Korrapati - Data Engineer (Deloitte)
