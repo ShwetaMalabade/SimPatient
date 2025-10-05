@@ -1,5 +1,5 @@
-// src/ui/ChatArea.jsx - PATIENT VOICE RESPONSE FIXED
-import React, { useEffect, useRef, useState } from 'react'
+// src/ui/ChatArea.jsx - FULLY WORKING VERSION
+import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { api } from '../lib/api.js'
 import { API_BASE } from '../lib/config.js'
 import {
@@ -30,17 +30,37 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
   const tokenRef = useRef(localStorage.getItem('token'))
   const voiceModeRef = useRef(false)
 
-  // Speech recognition hook
+  // Sync voiceMode ref
+  useEffect(() => {
+    voiceModeRef.current = voiceMode
+    console.log('Voice mode changed:', voiceMode)
+  }, [voiceMode])
+
+  // Speech recognition
   const { supported: sttSupported, listening, interim, start, stop } = useSpeech({
     silenceMs: 3500
   })
 
   const { level } = useVUMeter(voiceMode && listening)
 
-  // Sync voiceModeRef
-  useEffect(() => {
-    voiceModeRef.current = voiceMode
-  }, [voiceMode])
+  // Final text handler - MUST be stable reference
+  const handleFinalText = useCallback((text) => {
+    console.log('🎯 handleFinalText called with:', text)
+    console.log('   voiceModeRef.current:', voiceModeRef.current)
+    
+    if (!voiceModeRef.current) {
+      console.log('   ❌ Voice mode is OFF, ignoring')
+      return
+    }
+    
+    if (!text) {
+      console.log('   ❌ Empty text, ignoring')
+      return
+    }
+    
+    console.log('   ✅ Sending message...')
+    sendText(text)
+  }, []) // No dependencies - stable reference
 
   useEffect(() => {
     if (!threadId) return
@@ -61,51 +81,44 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     }
   }, [meta])
 
-  // IMPORTANT: Play patient audio when new patient message arrives
+  // Play patient audio when new message arrives
   useEffect(() => {
-    console.log('📊 Messages updated, checking for patient response...')
-    console.log('   Voice mode:', voiceModeRef.current)
-    console.log('   Total messages:', messages.length)
-    
     if (!voiceModeRef.current) {
-      console.log('   ❌ Voice mode OFF, skipping audio')
+      console.log('⏭️ Voice mode OFF, not playing audio')
       return
     }
+
+    console.log('🔍 Checking messages for patient response...', messages.length)
     
     const patientMessages = messages.filter(m => m.role === 'patient')
     console.log('   Patient messages:', patientMessages.length)
     
+    if (patientMessages.length === 0) {
+      console.log('   No patient messages yet')
+      return
+    }
+    
     const lastPatient = patientMessages[patientMessages.length - 1]
     
-    if (!lastPatient) {
-      console.log('   ❌ No patient messages yet')
-      return
-    }
-    
-    console.log('   Last patient ID:', lastPatient.id)
-    console.log('   Last spoken ID:', lastSpokenIdRef.current)
-    
     if (lastPatient.id === lastSpokenIdRef.current) {
-      console.log('   ⏭️ Already played this message')
+      console.log('   Already played:', lastPatient.id)
       return
     }
     
-    console.log('   ✅ NEW PATIENT MESSAGE! Playing audio...')
+    console.log('   🎤 NEW PATIENT MESSAGE! Playing:', lastPatient.id)
     lastSpokenIdRef.current = lastPatient.id
     playPatientAudio(lastPatient.id)
   }, [messages])
 
   async function playPatientAudio(messageId) {
     try {
-      console.log('🔊 Playing patient response:', messageId)
+      console.log('🔊 Fetching audio for message:', messageId)
       
-      // Stop listening while patient speaks
       if (listening) {
-        console.log('⏸️ Stopping mic for patient')
+        console.log('⏸️ Stopping mic')
         stop()
       }
 
-      // Stop any current audio
       if (audioRef.current) {
         audioRef.current.pause()
         audioRef.current = null
@@ -113,31 +126,29 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
 
       setAudioPlaying(true)
 
-      // Fetch ElevenLabs audio
-      console.log('📡 Fetching audio from backend...')
       const response = await fetch(`${API_BASE}/messages/${messageId}/speech`, {
         headers: { 'Authorization': `Bearer ${tokenRef.current}` }
       })
 
       if (!response.ok) {
-        console.error('❌ Audio fetch failed:', response.status)
-        throw new Error('Audio fetch failed')
+        throw new Error(`HTTP ${response.status}`)
       }
 
-      console.log('✅ Audio fetched successfully')
       const audioBlob = await response.blob()
+      console.log('📦 Got audio blob:', audioBlob.size, 'bytes')
+      
       const audioUrl = URL.createObjectURL(audioBlob)
       const audio = new Audio(audioUrl)
       audioRef.current = audio
 
       audio.onended = () => {
-        console.log('🎵 Patient finished speaking')
+        console.log('🎵 Audio finished')
         setAudioPlaying(false)
         URL.revokeObjectURL(audioUrl)
         audioRef.current = null
 
         if (voiceModeRef.current && status === 'open') {
-          console.log('🎤 Resuming mic in 1 second...')
+          console.log('🎤 Resuming mic...')
           setTimeout(() => {
             if (voiceModeRef.current) {
               start({ onFinalText: handleFinalText })
@@ -147,7 +158,7 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
       }
 
       audio.onerror = (e) => {
-        console.error('❌ Audio playback error:', e)
+        console.error('❌ Audio error:', e)
         setAudioPlaying(false)
         URL.revokeObjectURL(audioUrl)
         audioRef.current = null
@@ -157,24 +168,16 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
         }
       }
 
-      console.log('▶️ Playing audio NOW...')
+      console.log('▶️ Playing audio...')
       await audio.play()
-      console.log('🔊 Audio is playing...')
       
     } catch (err) {
-      console.error('❌ ElevenLabs error:', err)
+      console.error('❌ Playback error:', err)
       setAudioPlaying(false)
       
       if (voiceModeRef.current && status === 'open') {
         setTimeout(() => start({ onFinalText: handleFinalText }), 500)
       }
-    }
-  }
-
-  function handleFinalText(text) {
-    console.log('📨 Final text received:', text)
-    if (voiceModeRef.current && text) {
-      sendText(text)
     }
   }
 
@@ -185,12 +188,12 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
       setStatus(t.data.status)
       
       const res = await api.get(`/threads/${threadId}/messages`)
-      console.log('📥 Loaded', res.data.length, 'messages')
+      console.log('📥 Loaded messages:', res.data.length)
       setMessages(res.data)
       
       if (t.data.status === 'closed') loadFeedback()
     } catch (err) {
-      console.error('❌ Load failed:', err)
+      console.error('❌ Load error:', err)
     }
   }
 
@@ -204,30 +207,31 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
   }
 
   async function sendText(text) {
-    if (!text || status === 'closed') return
-    const content = text.trim()
-    if (!content) return
-
-    console.log('📤 Sending message:', content)
-
-    // Optimistic UI update
-    const tempMsg = {
-      id: 'tmp-' + Date.now(),
-      role: 'doctor',
-      content,
-      created_at: new Date().toISOString()
+    if (!text || status === 'closed') {
+      console.log('❌ Cannot send:', { text, status })
+      return
     }
-    setMessages(m => [...m, tempMsg])
+    
+    const content = text.trim()
+    if (!content) {
+      console.log('❌ Empty content')
+      return
+    }
+
+    console.log('📤 Sending:', content)
 
     try {
       const res = await api.post(`/threads/${threadId}/messages`, {
         role: 'doctor',
         content
       })
-      console.log('✅ Got response with', res.data.length, 'messages')
+      
+      console.log('✅ Response received:', res.data.length, 'messages')
       setMessages(res.data)
+      
     } catch (err) {
       console.error('❌ Send failed:', err)
+      alert('Failed to send message: ' + err.message)
     }
   }
 
@@ -269,7 +273,7 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     a.remove()
     URL.revokeObjectURL(url)
     
-    console.log('✅ Transcript downloaded')
+    console.log('✅ Downloaded')
   }
 
   function startVoice() {
@@ -277,12 +281,12 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
 
     console.log('🎙️ STARTING VOICE MODE')
     setVoiceMode(true)
-    lastSpokenIdRef.current = null // Reset to allow replaying
+    lastSpokenIdRef.current = null
     
     setTimeout(() => {
-      console.log('🎤 Starting microphone...')
+      console.log('🎤 Starting mic with callback...')
       start({ onFinalText: handleFinalText })
-    }, 200)
+    }, 300)
   }
 
   function endVoice() {
@@ -306,7 +310,7 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
           </div>
           <h2 className="text-xl font-semibold mb-2">Start a New Patient Session</h2>
           <p className="text-sm text-slate-600 mb-6">
-            Create a new chat to practice doctor–patient conversations.
+            Practice doctor–patient conversations with AI voice.
           </p>
           <button
             onClick={onThreadEmptyNew}
@@ -327,7 +331,6 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
           <button
             onClick={downloadTranscript}
             className="text-xs px-2 py-1 rounded-lg border border-slate-200 hover:bg-slate-50 flex items-center gap-1"
-            title="Download full conversation transcript"
           >
             <FileText className="w-3.5 h-3.5" /> Transcript
           </button>
@@ -337,12 +340,16 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
             <button
               disabled={status === 'closed'}
               onClick={() => (voiceMode ? endVoice() : startVoice())}
-              className={`h-9 px-3 rounded-xl border flex items-center gap-2 ${
-                voiceMode ? 'border-green-400 bg-green-50' : 'border-slate-200 hover:bg-slate-50'
+              className={`h-9 px-3 rounded-xl border flex items-center gap-2 transition-all ${
+                voiceMode 
+                  ? 'border-green-400 bg-green-50 shadow-md' 
+                  : 'border-slate-200 hover:bg-slate-50'
               }`}
             >
               {voiceMode ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-              <span className="text-xs">{voiceMode ? 'Voice On' : 'Voice'}</span>
+              <span className="text-xs font-medium">
+                {voiceMode ? 'Voice On' : 'Voice'}
+              </span>
             </button>
           ) : (
             <span className="text-[11px] text-slate-500 border border-slate-200 rounded-lg px-2 py-1">
@@ -366,6 +373,11 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
 
       <div ref={scrollRef} className="flex-1 overflow-auto p-6 space-y-4">
         {feedback && <div className="mb-4"><FeedbackCard data={feedback} /></div>}
+        {messages.length === 0 && (
+          <div className="text-center text-slate-400 mt-8">
+            <p>No messages yet. Start speaking or typing!</p>
+          </div>
+        )}
         {messages.map((m) => (
           <MessageBubble key={m.id} role={m.role} content={m.content} created_at={m.created_at} />
         ))}
@@ -376,14 +388,20 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                send()
+              }
+            }}
             rows={1}
-            placeholder={status === 'closed' ? 'Read-only' : 'Type or use voice…'}
+            placeholder={status === 'closed' ? 'Read-only' : voiceMode ? 'Voice mode active...' : 'Type your message…'}
             disabled={status === 'closed' || voiceMode}
-            className="flex-1 resize-none rounded-2xl border border-slate-200 px-4 py-3 focus:outline-none focus:ring-2 focus:ring-brand-400 disabled:bg-slate-50"
+            className="flex-1 resize-none rounded-2xl border border-slate-200 px-4 py-3 focus:outline-none focus:ring-2 focus:ring-brand-400 disabled:bg-slate-50 disabled:text-slate-500"
           />
           <button
             onClick={send}
-            className="rounded-2xl px-4 py-3 bg-brand-600 text-white hover:bg-brand-700 shadow-soft flex items-center gap-2 disabled:opacity-50"
+            className="rounded-2xl px-4 py-3 bg-brand-600 text-white hover:bg-brand-700 shadow-soft flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
             disabled={!input.trim() || status === 'closed' || voiceMode}
           >
             <SendHorizontal className="w-4 h-4" />
@@ -435,15 +453,15 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
 
             <button
               onClick={endVoice}
-              className="px-8 py-4 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center gap-3 font-semibold text-lg"
+              className="px-8 py-4 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center gap-3 font-semibold text-lg transition-all hover:scale-105"
             >
               <PhoneOff className="w-6 h-6" />
               End Voice
             </button>
 
-            <div className="text-sm text-gray-400 text-center mt-2">
+            <div className="text-sm text-gray-400 text-center">
               <p>💬 Messages: {messages.length}</p>
-              <p className="mt-1">📋 Click "Transcript" to download chat</p>
+              <p className="mt-1">🎤 Gemini AI + ElevenLabs Voice</p>
             </div>
           </div>
         </div>
@@ -458,10 +476,14 @@ function MessageBubble({ role, content, created_at }) {
     <div className={`flex ${isDoctor ? 'justify-end' : 'justify-start'}`}>
       <div
         className={`max-w-[70%] rounded-2xl px-4 py-3 shadow-soft ${
-          isDoctor ? 'bg-brand-600 text-white' : 'bg-white border border-slate-200'
+          isDoctor 
+            ? 'bg-brand-600 text-white' 
+            : 'bg-white border border-slate-200'
         }`}
       >
-        <div className="text-xs opacity-70 mb-1">{isDoctor ? 'Doctor' : 'Patient'}</div>
+        <div className="text-xs opacity-70 mb-1">
+          {isDoctor ? 'Doctor (You)' : 'Patient (AI)'}
+        </div>
         <div className="whitespace-pre-wrap leading-relaxed">{content}</div>
         <div className="text-[10px] opacity-50 mt-1">
           {new Date(created_at).toLocaleTimeString()}
