@@ -1,15 +1,16 @@
+// frontend/src/pages/ChatLayout.jsx - FIXED VERSION
 import React, { useEffect, useState } from 'react'
 import { useAuth } from '../auth/AuthContext.jsx'
 import { api, setAuthToken } from '../lib/api.js'
 import Sidebar from '../ui/Sidebar.jsx'
 import ChatArea from '../ui/ChatArea.jsx'
-import { useParams } from 'react-router-dom';
+import { useParams, useNavigate } from 'react-router-dom'
 
 export default function ChatLayout() {
   const { token, user } = useAuth()
+  const navigate = useNavigate()
+  const { threadId } = useParams() // Get threadId from URL
   const [threads, setThreads] = useState([])
-  const { threadId } = useParams(); 
-  const [activeId, setActiveId] = useState(null)
   const [activeMeta, setActiveMeta] = useState(null)
 
   useEffect(() => {
@@ -17,34 +18,47 @@ export default function ChatLayout() {
     fetchThreads()
   }, [token])
 
+  // Fetch thread metadata when threadId changes
   useEffect(() => {
-    setActiveId(threadId || null);
-  }, [threadId]);
+    if (!threadId) {
+      setActiveMeta(null)
+      return
+    }
+    
+    // Fetch the specific thread metadata
+    api.get(`/threads/${threadId}`)
+      .then(r => setActiveMeta(r.data))
+      .catch(err => {
+        console.error('Failed to load thread:', err)
+        // If thread doesn't exist, redirect to new chat
+        navigate('/newchat', { replace: true })
+      })
+  }, [threadId, navigate])
 
   async function fetchThreads() {
-    const res = await api.get('/threads')
-    setThreads(res.data)
-    if (!activeId && res.data.length > 0) {
-      setActiveId(res.data[0].id)
+    try {
+      const res = await api.get('/threads')
+      setThreads(res.data)
+    } catch (err) {
+      console.error('Failed to fetch threads:', err)
     }
   }
 
-  useEffect(() => {
-    console.log('Active id updated')
-    if (!activeId) { setActiveMeta(null); return }
-    api.get(`/threads/${activeId}`).then(r => setActiveMeta(r.data))
-  }, [activeId])
-
   async function newChat() {
-    const res = await api.post('/threads', { title: 'New Patient Session' })
-    setThreads([res.data, ...threads])
-    setActiveId(res.data.id)
-    setActiveMeta(res.data)
+    try {
+      const res = await api.post('/threads', { title: 'New Patient Session' })
+      setThreads([res.data, ...threads])
+      navigate(`/${res.data.id}`)
+    } catch (err) {
+      console.error('Failed to create thread:', err)
+    }
   }
 
   function onThreadUpdated(updated) {
     setThreads(prev => prev.map(t => t.id === updated.id ? { ...t, ...updated } : t))
-    if (activeId === updated.id) setActiveMeta(m => ({ ...(m || {}), ...updated }))
+    if (threadId === updated.id) {
+      setActiveMeta(m => ({ ...(m || {}), ...updated }))
+    }
   }
 
   return (
@@ -52,15 +66,17 @@ export default function ChatLayout() {
       <Sidebar
         user={user}
         threads={threads}
-        activeId={activeId}
-        setActiveId={setActiveId}
+        activeId={threadId} // Use threadId from URL
         onNewChat={newChat}
       />
       <ChatArea
-        key={activeId || 'empty'}
-        threadId={activeId}
+        key={threadId || 'empty'}
+        threadId={threadId}
         meta={activeMeta}
-        onEnded={(payload) => onThreadUpdated(payload.thread)}
+        onEnded={(payload) => {
+          onThreadUpdated(payload.thread)
+          fetchThreads() // Refresh thread list
+        }}
         onThreadEmptyNew={newChat}
       />
     </div>

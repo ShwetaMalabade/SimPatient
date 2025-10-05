@@ -358,6 +358,32 @@ def post_message(thread_id):
     return jsonify(messages), 201
 
 
+# @app.post("/api/threads/<thread_id>/end")
+# @login_required
+# def end_thread(thread_id):
+#     thread_ref = db.collection("users").document(request.user_id).collection("threads").document(thread_id)
+#     thread = thread_ref.get()
+#     if not thread.exists:
+#         return jsonify({"message": "Not found"}), 404
+
+#     fb_ref = thread_ref.collection("feedback").document("latest")
+#     fb_dict = generate_feedback_for_thread(request.user_id, thread_id)
+#     thread_ref.update({
+#         "status": "closed",
+#         "ended_at": dt.datetime.utcnow(),
+#         "updated_at": dt.datetime.utcnow()
+#     })
+#     fb_ref.set({
+#         "feedback_text": fb_dict["feedback_text"],
+#         "overall_score": fb_dict["overall_score"],
+#         "rubric_json": fb_dict["sections"],
+#         "created_at": dt.datetime.utcnow(),
+#     })
+#     return jsonify({
+#         "thread": {"id": thread_id, "status": "closed"},
+#         "feedback": fb_dict
+#     }), 200
+
 @app.post("/api/threads/<thread_id>/end")
 @login_required
 def end_thread(thread_id):
@@ -366,24 +392,57 @@ def end_thread(thread_id):
     if not thread.exists:
         return jsonify({"message": "Not found"}), 404
 
-    fb_ref = thread_ref.collection("feedback").document("latest")
-    fb_dict = generate_feedback_for_thread(request.user_id, thread_id)
-    thread_ref.update({
-        "status": "closed",
-        "ended_at": dt.datetime.utcnow(),
-        "updated_at": dt.datetime.utcnow()
-    })
-    fb_ref.set({
-        "feedback_text": fb_dict["feedback_text"],
-        "overall_score": fb_dict["overall_score"],
-        "rubric_json": fb_dict["sections"],
-        "created_at": dt.datetime.utcnow(),
-    })
-    return jsonify({
-        "thread": {"id": thread_id, "status": "closed"},
-        "feedback": fb_dict
-    }), 200
-
+    # ✅ CHECK MESSAGE COUNT - Don't evaluate empty sessions
+    msgs_ref = thread_ref.collection("messages")
+    messages = list(msgs_ref.stream())
+    
+    # Count doctor messages (actual conversation)
+    doctor_messages = [m for m in messages if m.to_dict().get("role") == "doctor"]
+    
+    if len(doctor_messages) < 2:
+        # Too few messages - delete the thread entirely
+        print(f"⚠️ Deleting empty thread {thread_id} - only {len(doctor_messages)} doctor messages")
+        
+        # Delete all messages first
+        for msg in messages:
+            msg.reference.delete()
+        
+        # Delete the thread
+        thread_ref.delete()
+        
+        return jsonify({
+            "message": "Thread deleted - insufficient conversation for evaluation",
+            "deleted": True
+        }), 200
+    
+    # Proceed with normal feedback generation
+    try:
+        fb_dict = generate_feedback_for_thread(request.user_id, thread_id)
+        
+        thread_ref.update({
+            "status": "closed",
+            "ended_at": dt.datetime.utcnow(),
+            "updated_at": dt.datetime.utcnow()
+        })
+        
+        fb_ref = thread_ref.collection("feedback").document("latest")
+        fb_ref.set({
+            "feedback_text": fb_dict["feedback_text"],
+            "overall_score": fb_dict["overall_score"],
+            "rubric_json": fb_dict["sections"],
+            "created_at": dt.datetime.utcnow(),
+        })
+        
+        return jsonify({
+            "thread": {"id": thread_id, "status": "closed"},
+            "feedback": fb_dict
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Feedback generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Failed to generate feedback: {str(e)}"}), 500
 
 @app.get("/api/threads/<thread_id>/feedback")
 @login_required

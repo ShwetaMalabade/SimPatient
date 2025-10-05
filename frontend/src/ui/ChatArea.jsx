@@ -186,22 +186,62 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     await sendText(text)
   }
 
-  async function endDiagnosis() {
-    const ok = confirm("End this session and generate feedback?")
-    if (!ok) return
+  // async function endDiagnosis() {
+  //   const ok = confirm("End this session and generate feedback?")
+  //   if (!ok) return
 
-    setEvaluating(true) // ⬅️ show overlay
+  //   setEvaluating(true) // ⬅️ show overlay
+  //   try {
+  //     const res = await api.post(`/threads/${threadId}/end`, {})
+  //     onEnded?.(res.data)
+  //     setStatus('closed')
+  //     await loadFeedback()
+  //     if (voiceMode) endVoice()
+  //   } catch (err) {
+  //     console.error('❌ End session failed:', err)
+  //     alert('Failed to end session: ' + err.message)
+  //   } finally {
+  //     setEvaluating(false) // ⬅️ hide overlay
+  //   }
+  // }
+
+  async function endDiagnosis() {
+    // Check if there are any doctor messages
+    const doctorMessages = messages.filter(m => m.role === 'doctor' && !m.typing)
+    
+    if (doctorMessages.length < 2) {
+      const confirmDelete = confirm(
+        "This session has very little conversation. It will be deleted instead of evaluated. Continue?"
+      )
+      if (!confirmDelete) return
+    } else {
+      const confirmEnd = confirm("End this session and generate feedback?")
+      if (!confirmEnd) return
+    }
+  
+    setEvaluating(true)
     try {
       const res = await api.post(`/threads/${threadId}/end`, {})
+      
+      // Check if thread was deleted (empty session)
+      if (res.data.deleted) {
+        alert('Session deleted - please start a new conversation with more dialogue for evaluation.')
+        // Redirect to new chat
+        window.location.href = '/newchat'
+        return
+      }
+      
+      // Normal feedback flow
       onEnded?.(res.data)
       setStatus('closed')
       await loadFeedback()
       if (voiceMode) endVoice()
+      
     } catch (err) {
       console.error('❌ End session failed:', err)
-      alert('Failed to end session: ' + err.message)
+      alert('Failed to end session: ' + (err.response?.data?.message || err.message))
     } finally {
-      setEvaluating(false) // ⬅️ hide overlay
+      setEvaluating(false)
     }
   }
 
