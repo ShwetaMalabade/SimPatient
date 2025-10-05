@@ -1,24 +1,36 @@
+// src/hooks/useVUMeter.js - Audio Level Meter
 import { useEffect, useRef, useState } from 'react'
+
 export function useVUMeter(active) {
   const [level, setLevel] = useState(0)
   const streamRef = useRef(null)
   const acRef = useRef(null)
   const rafRef = useRef(null)
+  
   useEffect(() => {
-    if (!active) { cleanup(); return }
+    if (!active) {
+      cleanup()
+      return
+    }
+    
     let cancelled = false
+    
     ;(async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
         if (cancelled) return
+        
         streamRef.current = stream
         const ac = new (window.AudioContext || window.webkitAudioContext)()
         acRef.current = ac
+        
         const src = ac.createMediaStreamSource(stream)
         const analyser = ac.createAnalyser()
         analyser.fftSize = 2048
         src.connect(analyser)
+        
         const data = new Uint8Array(analyser.fftSize)
+        
         const tick = () => {
           analyser.getByteTimeDomainData(data)
           let sum = 0
@@ -33,13 +45,22 @@ export function useVUMeter(active) {
         tick()
       } catch {}
     })()
-    return () => { cancelled = true; cleanup() }
+    
+    return () => {
+      cancelled = true
+      cleanup()
+    }
   }, [active])
+  
   function cleanup() {
     if (rafRef.current) cancelAnimationFrame(rafRef.current)
     rafRef.current = null
     if (acRef.current) { acRef.current.close(); acRef.current = null }
-    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+    }
   }
+  
   return { level }
 }

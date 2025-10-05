@@ -1,106 +1,171 @@
-// src/hooks/useSpeech.js
-import { useEffect, useRef, useState } from 'react'
+// src/hooks/useSpeech.js - Speech Recognition Hook
+import { useEffect, useRef, useState, useCallback } from 'react'
 
-// Prime mic permission in the SAME click as start(); do NOT await this.
-export function requestMicPermission() {
-  if (!navigator?.mediaDevices?.getUserMedia) return Promise.resolve()
-  return navigator.mediaDevices.getUserMedia({ audio: true })
-    .then(s => { s.getTracks().forEach(t => t.stop()) })
-    .catch(() => {}) // ignore; SpeechRecognition.start() will still error if blocked
-}
-
-export function useSpeech({
-  onFinalText,     // (text) => void (final OR silence-flush)
-  onInterimText,   // (text) => void
-  onStart,         // () => void
-  onEnd,           // () => void
-  onError,         // (err) => void
-  lang = 'en-US',
-  silenceMs = 3500,
-} = {}) {
-  const recRef = useRef(null)
-  const timerRef = useRef(null)
-  const interimRef = useRef('')
+export function useSpeech({ silenceMs = 3500 } = {}) {
   const [supported, setSupported] = useState(false)
   const [listening, setListening] = useState(false)
   const [interim, setInterim] = useState('')
+  
+  const recRef = useRef(null)
+  const activeRef = useRef(false)
+  const callbacksRef = useRef({})
+  const restartCountRef = useRef(0)
+  const silenceTimerRef = useRef(null)
+  const interimTextRef = useRef('')
 
   useEffect(() => {
-    const Rec = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!Rec) { setSupported(false); return }
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRecognition) {
+      console.error('❌ Speech recognition not supported')
+      setSupported(false)
+      return
+    }
+
+    console.log('🎤 Initializing speech recognition...')
     setSupported(true)
 
-    const rec = new Rec()
-    rec.lang = lang
-    rec.continuous = true
-    rec.interimResults = true
+    const recognition = new SpeechRecognition()
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.lang = 'en-US'
+    recognition.maxAlternatives = 1
 
-    const resetSilenceTimer = () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-      timerRef.current = setTimeout(() => {
-        const flush = (interimRef.current || '').trim()
-        if (flush && onFinalText) onFinalText(flush) // send whatever we heard on pause
-        try { rec.stop() } catch {}
+    recognition.onstart = () => {
+      console.log('✅ SPEECH STARTED')
+      setListening(true)
+      restartCountRef.current = 0
+      
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current)
+      silenceTimerRef.current = setTimeout(() => {
+        const text = interimTextRef.current.trim()
+        if (text && callbacksRef.current.onFinalText) {
+          console.log('⏱️ Silence timeout:', text)
+          callbacksRef.current.onFinalText(text)
+        }
+        interimTextRef.current = ''
+        setInterim('')
       }, silenceMs)
     }
 
-    rec.onstart = () => { setListening(true); onStart && onStart(); resetSilenceTimer() }
-
-    rec.onresult = (evt) => {
-      resetSilenceTimer()
-      let iText = ''
-      for (let i = evt.resultIndex; i < evt.results.length; i++) {
-        const r = evt.results[i]
-        if (r.isFinal) {
-          const finalText = r[0].transcript.trim()
-          interimRef.current = ''
+    recognition.onresult = (event) => {
+      let interimTranscript = ''
+      
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i]
+        if (result.isFinal) {
+          const finalText = result[0].transcript.trim()
+          console.log('✔️ Final result:', finalText)
+          if (finalText && callbacksRef.current.onFinalText) {
+            callbacksRef.current.onFinalText(finalText)
+          }
+          interimTextRef.current = ''
           setInterim('')
-          if (finalText && onFinalText) onFinalText(finalText)
         } else {
-          iText += r[0].transcript
+          interimTranscript += result[0].transcript
         }
       }
-      interimRef.current = iText
-      setInterim(iText)
-      onInterimText && onInterimText(iText)
+
+      if (interimTranscript) {
+        console.log('💬 Interim:', interimTranscript)
+        interimTextRef.current = interimTranscript
+        setInterim(interimTranscript)
+        
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current)
+        silenceTimerRef.current = setTimeout(() => {
+          const text = interimTextRef.current.trim()
+          if (text && callbacksRef.current.onFinalText) {
+            console.log('⏱️ Silence timeout:', text)
+            callbacksRef.current.onFinalText(text)
+          }
+          interimTextRef.current = ''
+          setInterim('')
+        }, silenceMs)
+      }
     }
 
-    rec.onerror = (e) => { onError && onError(e) }
+    recognition.onerror = (event) => {
+      console.error('❌ Speech error:', event.error)
+      
+      if (event.error === 'no-speech' || event.error === 'audio-capture') {
+        console.log('⚠️ Ignoring error, will auto-restart')
+        return
+      }
+      
+      if (event.error === 'not-allowed') {
+        console.error('🚫 Microphone permission denied!')
+        activeRef.current = false
+        setListening(false)
+      }
+    }
 
-    rec.onend = () => {
+    recognition.onend = () => {
+      console.log('⏹️ SPEECH ENDED')
       setListening(false)
-      interimRef.current = ''
-      setInterim('')
-      if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
-      onEnd && onEnd()
+      
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current)
+        silenceTimerRef.current = null
+      }
+
+      if (activeRef.current) {
+        restartCountRef.current++
+        if (restartCountRef.current <= 20) {
+          console.log(`🔄 Auto-restart ${restartCountRef.current}/20`)
+          setTimeout(() => {
+            if (activeRef.current) {
+              try {
+                recognition.start()
+              } catch (err) {
+                console.error('Restart failed:', err)
+              }
+            }
+          }, 100)
+        } else {
+          console.error('❌ Too many restarts')
+          activeRef.current = false
+        }
+      }
     }
 
-    recRef.current = rec
+    recRef.current = recognition
+
     return () => {
-      try { rec.abort() } catch {}
-      if (timerRef.current) clearTimeout(timerRef.current)
+      activeRef.current = false
+      try { recognition.abort() } catch {}
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current)
     }
-  }, [lang, silenceMs, onFinalText, onInterimText, onStart, onEnd, onError])
+  }, [silenceMs])
 
-  // IMPORTANT: synchronous start to preserve user-gesture chain
-  function start() { try { recRef.current?.start() } catch (e) { onError && onError(e) } }
-  function stop()  { try { recRef.current?.stop()  } catch (e) { onError && onError(e) } }
+  const start = useCallback((callbacks = {}) => {
+    console.log('▶️ START REQUESTED')
+    callbacksRef.current = callbacks
+    activeRef.current = true
+    restartCountRef.current = 0
+
+    try {
+      recRef.current?.start()
+    } catch (err) {
+      if (err.message?.includes('already started')) {
+        console.log('Already running')
+      } else {
+        console.error('Start error:', err)
+      }
+    }
+  }, [])
+
+  const stop = useCallback(() => {
+    console.log('⏸️ STOP REQUESTED')
+    activeRef.current = false
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current)
+      silenceTimerRef.current = null
+    }
+    try {
+      recRef.current?.stop()
+    } catch (err) {
+      console.error('Stop error:', err)
+    }
+  }, [])
 
   return { supported, listening, interim, start, stop }
-}
-
-// Text-to-Speech hook
-export function useTTS({ lang = 'en-US', rate = 1, pitch = 1, onEnd } = {}) {
-  const [speaking, setSpeaking] = useState(false)
-  const speak = (text) => {
-    if (!('speechSynthesis' in window)) return
-    const u = new SpeechSynthesisUtterance(text)
-    u.lang = lang; u.rate = rate; u.pitch = pitch
-    u.onstart = () => setSpeaking(true)
-    u.onend = () => { setSpeaking(false); onEnd && onEnd() }
-    window.speechSynthesis.cancel()
-    window.speechSynthesis.speak(u)
-  }
-  const cancel = () => { try { window.speechSynthesis.cancel() } catch {} ; setSpeaking(false) }
-  return { speak, cancel, speaking }
 }

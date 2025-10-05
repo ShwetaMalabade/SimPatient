@@ -2,8 +2,9 @@ import os
 import datetime as dt
 from functools import wraps
 from typing import Optional, List
+from io import BytesIO
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Text
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
@@ -13,15 +14,19 @@ import jwt
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 
+# Gemini AI
 from google import genai
 from google.genai.types import Content, Part, GenerateContentConfig
+
+# ElevenLabs
+from elevenlabs.client import ElevenLabs
+from elevenlabs import VoiceSettings
 
 SYSTEM_INSTRUCTION = (
     "You are role-playing a patient in a clinical interview. "
     "Stay consistent with earlier answers. Do not provide diagnoses or medical advice. "
     "Only speak as the patient."
 )
-
 
 SECRET = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:5173")
@@ -36,11 +41,20 @@ GOOGLE_APPLICATION_CREDENTIALS = os.environ.get(
 )
 TUNED_MODEL = os.environ.get("TUNED_MODEL", "")
 
+# ElevenLabs Configuration
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+
+# Initialize Gemini client
 client = genai.Client(
-    vertexai=True,          # <-- IMPORTANT: use Vertex AI, not API key mode
+    vertexai=True,
     project=GCP_PROJECT_ID,
     location=GCP_LOCATION,
 )
+
+# Initialize ElevenLabs client
+elevenlabs_client = None
+if ELEVENLABS_API_KEY:
+    elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": [FRONTEND_ORIGIN]}}, supports_credentials=False)
@@ -67,7 +81,7 @@ class Thread(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=False, default="New Patient Session")
-    status = Column(String, nullable=False, default="open")  # "open" | "closed"
+    status = Column(String, nullable=False, default="open")
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     updated_at = Column(DateTime, default=dt.datetime.utcnow)
     ended_at = Column(DateTime, nullable=True)
@@ -80,7 +94,7 @@ class Message(Base):
     __tablename__ = "messages"
     id = Column(Integer, primary_key=True)
     thread_id = Column(Integer, ForeignKey("threads.id"), nullable=False)
-    role = Column(String, nullable=False)  # 'doctor' or 'patient'
+    role = Column(String, nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
 
@@ -91,7 +105,7 @@ class Feedback(Base):
     id = Column(Integer, primary_key=True)
     thread_id = Column(Integer, ForeignKey("threads.id"), nullable=False, unique=True)
     overall_score = Column(Integer, nullable=False)
-    rubric_json = Column(Text, nullable=False)  # JSON string with section scores/text
+    rubric_json = Column(Text, nullable=False)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
 
     thread = relationship("Thread", back_populates="feedback")
@@ -136,14 +150,13 @@ def login_required(fn):
             session.close()
     return wrapper
 
-# --- Utility: simple feedback generator (placeholder, deterministic) ---
+# --- Utility: feedback generator ---
 def _score_section(texts: List[str], keywords: List[str]) -> int:
     text = " ".join(texts).lower()
     hits = sum(1 for k in keywords if k in text)
-    return max(0, min(5, hits))  # 0..5
+    return max(0, min(5, hits))
 
 def generate_feedback_for_thread(messages: List[Message]) -> dict:
-    # Separate doctor questions vs patient answers
     doc = [m.content for m in messages if m.role == "doctor"]
     pat = [m.content for m in messages if m.role == "patient"]
 
@@ -179,13 +192,37 @@ def generate_feedback_for_thread(messages: List[Message]) -> dict:
             "feedback": "Use plain language and teach-back to confirm understanding."
         }
     }
-    raw = sum(sec["score"] for sec in sections.values())  # max 30
-    overall = round((raw / 30) * 100)  # 0..100
+    raw = sum(sec["score"] for sec in sections.values())
+    overall = round((raw / 30) * 100)
 
     return {
         "overall_score": overall,
         "sections": sections
     }
+
+# --- ElevenLabs TTS ---
+def generate_speech_elevenlabs(text: str) -> bytes:
+    """Generate speech audio using ElevenLabs API"""
+    if not elevenlabs_client:
+        raise Exception("ElevenLabs not configured")
+    
+    print(f"🔊 Generating speech for: {text[:50]}...")
+    
+    audio_generator = elevenlabs_client.generate(
+        text=text,
+        voice="21m00Tcm4TlvDq8ikWAM",  # Rachel - natural female voice
+        model="eleven_monolingual_v1",
+        voice_settings=VoiceSettings(
+            stability=0.5,
+            similarity_boost=0.75,
+            style=0.0,
+            use_speaker_boost=True
+        )
+    )
+    
+    audio_bytes = b"".join(audio_generator)
+    print(f"✅ Generated {len(audio_bytes)} bytes of audio")
+    return audio_bytes
 
 # --- API Routes ---
 
@@ -231,7 +268,6 @@ def google_login():
     except Exception as e:
         return jsonify({"message": f"Google token invalid: {str(e)}"}), 401
 
-# Dev bypass login
 @app.post("/api/auth/dev-login")
 def dev_login():
     data = request.get_json() or {}
@@ -282,21 +318,6 @@ def list_threads():
         "ended_at": t.ended_at.isoformat() if t.ended_at else None
     } for t in threads])
 
-# @app.post("/api/threads")
-# @login_required
-# def create_thread():
-#     s = request.dbs
-#     u = request.user
-#     title = (request.get_json() or {}).get("title") or "New Patient Session"
-#     t = Thread(user_id=u.id, title=title, status="open")
-#     s.add(t)
-#     s.commit()
-#     return jsonify({
-#         "id": t.id, "title": t.title, "status": t.status,
-#         "created_at": t.created_at.isoformat(), "updated_at": t.updated_at.isoformat(),
-#         "ended_at": None
-#     }), 201
-
 @app.post("/api/threads")
 @login_required
 def create_thread():
@@ -306,7 +327,6 @@ def create_thread():
     title = (payload.get("title") or "").strip()
 
     if not title:
-        # Auto title: Patient #<count+1>
         count = s.query(Thread).filter_by(user_id=u.id).count()
         title = f"Patient {count + 1}"
 
@@ -318,7 +338,6 @@ def create_thread():
         "created_at": t.created_at.isoformat(), "updated_at": t.updated_at.isoformat(),
         "ended_at": None
     }), 201
-
 
 @app.get("/api/threads/<int:tid>")
 @login_required
@@ -365,10 +384,7 @@ def post_message(tid):
     s.add(dm)
 
     if role == "doctor":
-        # Get conversation history for context-aware responses
         conversation_history = s.query(Message).filter_by(thread_id=t.id).order_by(Message.created_at.asc()).all()
-        
-        # Generate patient reply with conversation context
         reply = simulate_patient_reply(prompt=content, conversation_history=conversation_history)
         pm = Message(thread_id=t.id, role="patient", content=reply)
         s.add(pm)
@@ -380,6 +396,38 @@ def post_message(tid):
     return jsonify([{
         "id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat()
     } for m in msgs]), 201
+
+# NEW: ElevenLabs speech endpoint
+@app.get("/api/messages/<int:msg_id>/speech")
+@login_required
+def get_message_speech(msg_id):
+    """Generate and return speech audio for a patient message"""
+    s = request.dbs
+    msg = s.get(Message, msg_id)
+    
+    if not msg:
+        return jsonify({"message": "Message not found"}), 404
+    
+    thread = s.get(Thread, msg.thread_id)
+    if not thread or thread.user_id != request.user.id:
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    if msg.role != "patient":
+        return jsonify({"message": "Only patient messages have speech"}), 400
+    
+    try:
+        audio_bytes = generate_speech_elevenlabs(msg.content)
+        return send_file(
+            BytesIO(audio_bytes),
+            mimetype="audio/mpeg",
+            as_attachment=False,
+            download_name=f"patient_{msg_id}.mp3"
+        )
+    except Exception as e:
+        print(f"❌ ElevenLabs error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Speech generation failed: {str(e)}"}), 500
 
 @app.patch("/api/threads/<int:tid>")
 @login_required
@@ -412,20 +460,14 @@ def delete_thread(tid):
     s.commit()
     return jsonify({"ok": True})
 
-
 @app.post("/api/threads/<int:tid>/end")
 @login_required
 def end_thread(tid):
-    """
-    Close the thread and generate feedback (idempotent).
-    Body: { doctor_notes?: string }
-    """
     s = request.dbs
     t = s.get(Thread, tid)
     if not t or t.user_id != request.user.id:
         return jsonify({"message": "Not found"}), 404
 
-    # If already closed, return existing feedback
     if t.status == "closed":
         fb = t.feedback
         if fb:
@@ -442,13 +484,10 @@ def end_thread(tid):
                     "created_at": fb.created_at.isoformat()
                 }
             }), 200
-        # fall through to regenerate if somehow missing
 
-    # Generate feedback
     msgs = s.query(Message).filter_by(thread_id=t.id).order_by(Message.created_at.asc()).all()
     fb_dict = generate_feedback_for_thread(msgs)
 
-    # Persist
     t.status = "closed"
     t.ended_at = dt.datetime.utcnow()
     t.updated_at = dt.datetime.utcnow()
@@ -495,19 +534,9 @@ def get_feedback(tid):
     })
 
 def simulate_patient_reply(prompt: str, conversation_history: List[Message] = None) -> str:
-    """
-    Generate a patient reply using the fine-tuned Gemini model from Vertex AI.
-    
-    Args:
-        prompt: The current doctor's message
-        conversation_history: List of previous messages for context
-    
-    Returns:
-        The patient's response generated by the model
-    """
-    # Fallback to static responses if Vertex AI is not configured
+    """Generate patient reply using Gemini AI"""
     if not GCP_PROJECT_ID:
-        print("⚠ Vertex AI not configured, using fallback static response")
+        print("⚠ Vertex AI not configured, using fallback")
         p = prompt.lower()
         if any(k in p for k in ["pain", "ache", "hurt"]):
             return "I've had a dull ache for about 3 days. It gets worse when I move."
@@ -517,10 +546,9 @@ def simulate_patient_reply(prompt: str, conversation_history: List[Message] = No
             return "I've been coughing a lot and feel a little short of breath after climbing stairs."
         if any(k in p for k in ["medication", "allergy", "drug"]):
             return "I take only a daily multivitamin. I'm allergic to penicillin."
-        return "I'm not sure, doctor. Could you explain what you mean or what else you need to know?"
+        return "I'm not sure, doctor. Could you explain what you mean?"
     
     try:
-        # Build conversation context for the model
         context = ""
         if conversation_history:
             context = "Conversation history:\n"
@@ -529,13 +557,9 @@ def simulate_patient_reply(prompt: str, conversation_history: List[Message] = No
                 context += f"{role_label}: {msg.content}\n"
             context += "\n"
         
-        # Create the full prompt with context
-        full_prompt = f"{context} {prompt}\n"
+        full_prompt = f"{context}{prompt}\n"
        
-        contents = [
-            Content(role="user", parts=[Part.from_text(text = full_prompt)])
-        ]
-
+        contents = [Content(role="user", parts=[Part.from_text(text=full_prompt)])]
         
         response = client.models.generate_content(
             model=TUNED_MODEL,
@@ -546,23 +570,20 @@ def simulate_patient_reply(prompt: str, conversation_history: List[Message] = No
             ),
         )
                 
-        # Extract and return the text
         if not response or not response.text:
-            return"I'm not sure how to respond to that." 
+            return "I'm not sure how to respond to that." 
         
         return response.text.strip()
         
     except Exception as e:
-        print(f"⚠ Error calling Vertex AI: {e}")
+        print(f"⚠ Vertex AI error: {e}")
         import traceback
         traceback.print_exc()
-        # Fallback to a generic response
-        return "I'm having trouble expressing myself right now. Could you rephrase your question?"
+        return "I'm having trouble expressing myself. Could you rephrase?"
 
-# Optional landing
 @app.get("/")
 def home():
-    return ("<h1>MediSim API</h1><p>Backend is running. Try <code>/api/threads</code> (with JWT).</p>", 200)
+    return ("<h1>MediSim API</h1><p>Backend is running. Gemini AI + ElevenLabs integrated.</p>", 200)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5001"))
