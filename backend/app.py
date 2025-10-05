@@ -458,6 +458,145 @@ def get_message_speech(msg_id):
         import traceback
         traceback.print_exc()
         return jsonify({"message": f"Speech generation failed: {str(e)}"}), 500
+    
+# Add this to app.py after the other routes
+
+# Replace the @app.get("/api/analytics") endpoint in app.py with this:
+
+@app.get("/api/analytics")
+@login_required
+def get_analytics():
+    """Get comprehensive analytics for the logged-in doctor"""
+    try:
+        # Fetch all closed threads (no order_by to avoid index requirement)
+        threads_ref = (
+            db.collection("users")
+            .document(request.user_id)
+            .collection("threads")
+            .where("status", "==", "closed")
+        )
+        
+        sessions_data = []
+        category_totals = {
+            "history": [], "red_flags": [], "meds_allergies": [],
+            "differential": [], "plan": [], "communication": []
+        }
+        overall_scores = []
+        
+        # Collect all threads
+        all_threads = []
+        for thread_snap in threads_ref.stream():
+            thread_data = thread_snap.to_dict()
+            thread_id = thread_snap.id
+            
+            # Get feedback for this thread
+            fb_ref = (
+                db.collection("users").document(request.user_id)
+                .collection("threads").document(thread_id)
+                .collection("feedback").document("latest")
+            )
+            fb_snap = fb_ref.get()
+            
+            if fb_snap.exists:
+                fb_data = fb_snap.to_dict()
+                rubric = fb_data.get("rubric_json", {})
+                if isinstance(rubric, str):
+                    rubric = json.loads(rubric)
+                
+                sections = rubric.get("sections", rubric)
+                overall_score = fb_data.get("overall_score", 0)
+                
+                all_threads.append({
+                    "id": thread_id,
+                    "title": thread_data.get("title", "Untitled"),
+                    "ended_at": thread_data.get("ended_at"),
+                    "ended_at_iso": _iso(thread_data.get("ended_at")),
+                    "overall_score": overall_score,
+                    "sections": sections
+                })
+        
+        # Sort by ended_at in Python (most recent first)
+        all_threads.sort(key=lambda x: x.get("ended_at") or dt.datetime.min, reverse=True)
+        
+        # Process sorted threads
+        for thread in all_threads:
+            overall_scores.append(thread["overall_score"])
+            
+            for category in category_totals.keys():
+                if category in thread["sections"]:
+                    score = thread["sections"][category].get("score", 0)
+                    category_totals[category].append(score)
+            
+            sessions_data.append({
+                "id": thread["id"],
+                "title": thread["title"],
+                "ended_at": thread["ended_at_iso"],
+                "overall_score": thread["overall_score"],
+                "categories": {
+                    cat: thread["sections"].get(cat, {}).get("score", 0) 
+                    for cat in category_totals.keys()
+                }
+            })
+        
+        total_sessions = len(overall_scores)
+        
+        if total_sessions == 0:
+            return jsonify({
+                "total_sessions": 0,
+                "overall_avg": 0,
+                "category_avg": {},
+                "trend_data": [],
+                "recent_sessions": [],
+                "insights": {"strongest": None, "weakest": None, "improvement_areas": []}
+            })
+        
+        overall_avg = sum(overall_scores) / total_sessions
+        
+        # Calculate category averages (convert 0-5 scale to 0-100)
+        category_avg = {
+            cat: (sum(scores) / len(scores) * 20) if scores else 0
+            for cat, scores in category_totals.items()
+        }
+        
+        # Find strongest and weakest areas
+        strongest = max(category_avg.items(), key=lambda x: x[1])
+        weakest = min(category_avg.items(), key=lambda x: x[1])
+        
+        # Improvement areas (categories below 60%)
+        improvement_areas = [
+            {"category": cat, "score": score}
+            for cat, score in category_avg.items() if score < 60
+        ]
+        
+        # Trend data (last 10 sessions, oldest to newest)
+        trend_data = [
+            {
+                "session": f"S{i+1}",
+                "score": sessions_data[i]["overall_score"],
+                "date": sessions_data[i]["ended_at"]
+            }
+            for i in range(min(10, len(sessions_data)))
+        ]
+        trend_data.reverse()  # Reverse to show oldest to newest
+        
+        return jsonify({
+            "total_sessions": total_sessions,
+            "overall_avg": round(overall_avg, 1),
+            "category_avg": {k: round(v, 1) for k, v in category_avg.items()},
+            "trend_data": trend_data,
+            "recent_sessions": sessions_data[:5],  # Last 5 sessions
+            "insights": {
+                "strongest": {"category": strongest[0], "score": round(strongest[1], 1)},
+                "weakest": {"category": weakest[0], "score": round(weakest[1], 1)},
+                "improvement_areas": improvement_areas
+            }
+        })
+        
+    except Exception as e:
+        print(f"❌ Analytics error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Analytics failed: {str(e)}"}), 500
 
 
 @app.get("/")

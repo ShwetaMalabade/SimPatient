@@ -1,5 +1,6 @@
+// frontend/src/ui/Sidebar.jsx - UPDATED
 import React from 'react'
-import { Plus, Stethoscope, LogOut, Lock } from 'lucide-react'
+import { Plus, Stethoscope, LogOut, Lock, BarChart3 } from 'lucide-react'
 import { useAuth } from '../auth/AuthContext.jsx'
 import { useNavigate } from 'react-router-dom'
 import defaultProfile from '../images/default-profile.webp'
@@ -23,6 +24,15 @@ export default function Sidebar({ user, threads, activeId }) {
           <LogOut className="w-4 h-4" />
         </button>
       </div>
+
+      {/* Dashboard Link - NEW */}
+      <button
+        onClick={() => navigate('/dashboard')}
+        className="flex items-center gap-2 justify-center rounded-2xl border border-teal-200 bg-teal-50 py-2 hover:bg-teal-100"
+      >
+        <BarChart3 className="w-4 h-4 text-teal-700" />
+        <span className="font-medium text-teal-700">View Analytics</span>
+      </button>
 
       {/* New chat → /newchat */}
       <button
