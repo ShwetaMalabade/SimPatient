@@ -2,6 +2,7 @@ import React from 'react'
 
 export default function FeedbackCard({ data }) {
   if (!data) return null
+  console.log(data)
   const parsed = typeof data.rubric === 'string' ? JSON.parse(data.rubric) : data.rubric
   const sections = parsed.sections || {}
   return (
@@ -12,6 +13,15 @@ export default function FeedbackCard({ data }) {
           Score {parsed.overall_score}/100
         </span>
       </div>
+      {/* ✅ Added summary tile */}
+      {parsed?.feedback_text && (
+        <div className="w-full mb-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <h3 className="text-base font-semibold mb-2 text-slate-900">Summary</h3>
+          <p className="whitespace-pre-wrap text-slate-700">
+            {parsed.feedback_text}
+          </p>
+        </div>
+      )}
       <div className="grid md:grid-cols-2 gap-3">
         {Object.entries(sections).map(([key, sec]) => (
           <div key={key} className="rounded-xl border border-slate-100 p-3">
