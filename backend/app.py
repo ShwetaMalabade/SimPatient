@@ -272,7 +272,7 @@ def dev_login():
 @app.get("/api/threads")
 @login_required
 def list_threads():
-    threads_ref = db.collection("users").document(request.user_id).collection("threads")
+    threads_ref = db.collection("users").document(request.user_id).collection("threads").order_by("created_at", direction="DESCENDING")
     status = request.args.get("status")
     q = threads_ref
     if status:
