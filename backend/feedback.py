@@ -43,11 +43,12 @@ SECTION_HINTS = {
 
 def _messages_to_contents(messages):
     out = []
+    print("Messages to contents:", messages)
     for m in messages:
-        if m.role == "doctor":
-            out.append(Content(role="user", parts=[Part.from_text(text=m.content)]))
+        if m["role"] == "doctor":
+            out.append(Content(role="user", parts=[Part.from_text(text=m["content"])]))
         else:
-            out.append(Content(role="model", parts=[Part.from_text(text=m.content)]))
+            out.append(Content(role="model", parts=[Part.from_text(text=m["content"])]))
     return out
 
 EVAL_SYSTEM = (

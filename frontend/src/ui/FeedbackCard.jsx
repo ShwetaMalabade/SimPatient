@@ -3,22 +3,21 @@ import React from 'react'
 export default function FeedbackCard({ data }) {
   if (!data) return null
   console.log(data)
-  const parsed = typeof data.rubric === 'string' ? JSON.parse(data.rubric) : data.rubric
-  const sections = parsed.sections || {}
+  const parsed = typeof data.rubric_json === 'string' ? JSON.parse(data.rubric_json) : data.rubric_json
+  const sections = parsed.sections || parsed
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-soft">
       <div className="flex items-baseline gap-3 mb-2">
         <h3 className="text-sm font-semibold">Session Feedback</h3>
         <span className="text-xs px-2 py-0.5 rounded-full bg-brand-100 text-brand-800">
-          Score {parsed.overall_score}/100
+          Score {data.overall_score}/100
         </span>
       </div>
-      {/* ✅ Added summary tile */}
-      {parsed?.feedback_text && (
+      {data?.feedback_text && (
         <div className="w-full mb-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
           <h3 className="text-base font-semibold mb-2 text-slate-900">Summary</h3>
           <p className="whitespace-pre-wrap text-slate-700">
-            {parsed.feedback_text}
+            {data.feedback_text}
           </p>
         </div>
       )}

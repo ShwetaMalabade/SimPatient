@@ -3,33 +3,29 @@ import datetime as dt
 from functools import wraps
 from typing import Optional, List
 from io import BytesIO
+import json
+import jwt
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Text
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-import jwt
-import json
-
-# Google ID token verification
+from google.cloud import firestore
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
-
-# Gemini AI
 from google import genai
 from google.genai.types import Content, Part, GenerateContentConfig
 
 from feedback import generate_feedback_json_with_model_v2
 
-# ElevenLabs - with error handling
 try:
     from elevenlabs.client import ElevenLabs
     from elevenlabs import VoiceSettings
     ELEVENLABS_AVAILABLE = True
 except ImportError:
-    print("⚠️ WARNING: elevenlabs package not installed. Run: pip install elevenlabs==1.7.0")
+    print("⚠️ elevenlabs not installed. Run: pip install elevenlabs==1.7.0")
     ELEVENLABS_AVAILABLE = False
 
+
+# --- CONFIGURATION ---
 SYSTEM_INSTRUCTION = (
     "You are role-playing a patient in a clinical interview. "
     "Stay consistent with earlier answers. Do not provide diagnoses or medical advice. "
@@ -39,23 +35,16 @@ SYSTEM_INSTRUCTION = (
 SECRET = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:5173")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
-
-# Vertex AI Configuration
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
 GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
 TUNED_MODEL = os.environ.get("TUNED_MODEL", "")
-
-# ElevenLabs Configuration
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 
-# Initialize Gemini client
-client = genai.Client(
-    vertexai=True,
-    project=GCP_PROJECT_ID,
-    location=GCP_LOCATION,
-)
+# --- INITIALIZATION ---
+db = firestore.Client(project=GCP_PROJECT_ID)
 
-# Initialize ElevenLabs client with error handling
+genai_client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location=GCP_LOCATION)
+
 elevenlabs_client = None
 if ELEVENLABS_AVAILABLE and ELEVENLABS_API_KEY:
     try:
@@ -63,451 +52,68 @@ if ELEVENLABS_AVAILABLE and ELEVENLABS_API_KEY:
         print("✅ ElevenLabs initialized successfully")
     except Exception as e:
         print(f"❌ ElevenLabs initialization failed: {e}")
-        elevenlabs_client = None
 else:
-    if not ELEVENLABS_AVAILABLE:
-        print("⚠️ ElevenLabs package not available")
-    if not ELEVENLABS_API_KEY:
-        print("⚠️ ELEVENLABS_API_KEY not set in .env")
+    print("⚠️ ElevenLabs unavailable or missing API key")
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": [FRONTEND_ORIGIN]}}, supports_credentials=False)
 
-# --- DB setup (SQLite) ---
-Base = declarative_base()
-engine = create_engine("sqlite:///medsim.db", echo=False, future=True)
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True)
-    email = Column(String, unique=True, nullable=False, index=True)
-    name = Column(String, nullable=False)
-    picture = Column(String, nullable=True)
-    hospital = Column(String, nullable=True)
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
-    last_login = Column(DateTime, default=dt.datetime.utcnow)
-    threads = relationship("Thread", back_populates="user", cascade="all,delete")
-
-class Thread(Base):
-    __tablename__ = "threads"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title = Column(String, nullable=False, default="New Patient Session")
-    status = Column(String, nullable=False, default="open")
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
-    updated_at = Column(DateTime, default=dt.datetime.utcnow)
-    ended_at = Column(DateTime, nullable=True)
-    user = relationship("User", back_populates="threads")
-    messages = relationship("Message", back_populates="thread", cascade="all,delete", order_by="Message.created_at")
-    feedback = relationship("Feedback", back_populates="thread", uselist=False, cascade="all,delete")
-
-class Message(Base):
-    __tablename__ = "messages"
-    id = Column(Integer, primary_key=True)
-    thread_id = Column(Integer, ForeignKey("threads.id"), nullable=False)
-    role = Column(String, nullable=False)
-    content = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
-    thread = relationship("Thread", back_populates="messages")
-
-class Feedback(Base):
-    __tablename__ = "feedback"
-    id = Column(Integer, primary_key=True)
-    thread_id = Column(Integer, ForeignKey("threads.id"), nullable=False, unique=True)
-    feedback_text = Column(Text, nullable=False)
-    overall_score = Column(Integer, nullable=False)
-    rubric_json = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
-    thread = relationship("Thread", back_populates="feedback")
-
-Base.metadata.create_all(engine)
-
-# --- Auth helpers ---
-def create_token(user: User) -> str:
+# --- AUTH HELPERS ---
+def create_token(uid: str, email: str) -> str:
     payload = {
-        "sub": str(user.id),
-        "email": user.email,
+        "sub": uid,
+        "email": email,
         "exp": dt.datetime.utcnow() + dt.timedelta(days=7)
     }
     return jwt.encode(payload, SECRET, algorithm="HS256")
 
-def current_user(session) -> Optional[User]:
+
+def current_user() -> Optional[str]:
     auth = request.headers.get("Authorization", "")
     parts = auth.split()
     if len(parts) == 2 and parts[0].lower() == "bearer":
         token = parts[1]
         try:
             data = jwt.decode(token, SECRET, algorithms=["HS256"])
-            uid = int(data["sub"])
-            user = session.get(User, uid)
-            return user
+            return data["sub"]
         except Exception:
             return None
     return None
 
+
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        session = SessionLocal()
-        try:
-            user = current_user(session)
-            if not user:
-                return jsonify({"message": "Unauthorized"}), 401
-            request.user = user
-            request.dbs = session
-            return fn(*args, **kwargs)
-        finally:
-            session.close()
+        uid = current_user()
+        if not uid:
+            return jsonify({"message": "Unauthorized"}), 401
+        request.user_id = uid
+        return fn(*args, **kwargs)
     return wrapper
 
-# --- Feedback generator ---
-def _score_section(texts: List[str], keywords: List[str]) -> int:
-    text = " ".join(texts).lower()
-    hits = sum(1 for k in keywords if k in text)
-    return max(0, min(5, hits))
 
-def generate_feedback_for_thread(tid:int) -> dict:
-    s = request.dbs
-    t = s.get(Thread, tid)
-    if not t or t.user_id != request.user.id:
-        # Let caller handle 404; returning a dict keeps this function pure
-        return {
-            "feedback_text": "Thread not found or unauthorized.",
-            "overall_score": 0,
-            "sections": {
-                "history":       {"title": "History Taking", "score": 0, "feedback": "Consider OPQRST ..."},
-                "red_flags":     {"title": "Red Flags", "score": 0, "feedback": "Screen for red flags ..."},
-                "meds_allergies":{"title": "Meds & Allergies", "score": 0, "feedback": "Clarify current meds ..."},
-                "differential":  {"title": "Differential Diagnosis", "score": 0, "feedback": "State a brief differential ..."},
-                "plan":          {"title": "Plan & Counseling", "score": 0, "feedback": "Outline next steps and safety-netting ..."},
-                "communication": {"title": "Communication", "score": 0, "feedback": "Use plain language and teach-back ..."},
-            }
-        }
-
-    msgs = (
-        s.query(Message)
-        .filter_by(thread_id=t.id)
-        .order_by(Message.created_at.asc())
-        .all()
-    )
-    return generate_feedback_json_with_model_v2(msgs)
-
-# --- ElevenLabs TTS with error handling ---
+# --- ELEVENLABS TTS ---
 def generate_speech_elevenlabs(text: str) -> bytes:
-    """Generate speech using ElevenLabs with proper error handling"""
-    
     if not elevenlabs_client:
-        error_msg = "ElevenLabs not configured. "
-        if not ELEVENLABS_AVAILABLE:
-            error_msg += "Package not installed. Run: pip install elevenlabs==1.7.0"
-        elif not ELEVENLABS_API_KEY:
-            error_msg += "API key not set in .env file"
-        print(f"❌ {error_msg}")
-        raise Exception(error_msg)
-    
-    try:
-        print(f"🔊 Generating speech: {text[:50]}...")
-        
-        audio_generator = elevenlabs_client.generate(
-            text=text,
-            voice="21m00Tcm4TlvDq8ikWAM",  # Rachel
-            model="eleven_monolingual_v1",
-            voice_settings=VoiceSettings(
-                stability=0.5,
-                similarity_boost=0.75,
-                style=0.0,
-                use_speaker_boost=True
-            )
+        raise Exception("ElevenLabs not configured properly")
+    audio_generator = elevenlabs_client.generate(
+        text=text,
+        voice="21m00Tcm4TlvDq8ikWAM",
+        model="eleven_monolingual_v1",
+        voice_settings=VoiceSettings(
+            stability=0.5,
+            similarity_boost=0.75,
+            style=0.0,
+            use_speaker_boost=True
         )
-        
-        audio_bytes = b"".join(audio_generator)
-        print(f"✅ Generated {len(audio_bytes)} bytes")
-        return audio_bytes
-        
-    except Exception as e:
-        print(f"❌ ElevenLabs generation error: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+    )
+    return b"".join(audio_generator)
 
-# --- API Routes ---
 
-@app.post("/api/auth/google-login")
-def google_login():
-    data = request.get_json() or {}
-    idtok = data.get("id_token")
-    hospital = data.get("hospital")
-    if not idtok or not hospital:
-        return jsonify({"message": "Missing id_token or hospital"}), 400
-    try:
-        if GOOGLE_CLIENT_ID:
-            ginfo = id_token.verify_oauth2_token(idtok, grequests.Request(), GOOGLE_CLIENT_ID)
-        else:
-            ginfo = id_token.verify_oauth2_token(idtok, grequests.Request())
-        email = ginfo["email"]
-        name = ginfo.get("name", email.split("@")[0])
-        picture = ginfo.get("picture", "")
-        session = SessionLocal()
-        user = session.query(User).filter_by(email=email).first()
-        if not user:
-            user = User(email=email, name=name, picture=picture, hospital=hospital)
-            session.add(user)
-            session.commit()
-        else:
-            user.name = name
-            user.picture = picture or user.picture
-            user.hospital = hospital or user.hospital
-            user.last_login = dt.datetime.utcnow()
-            session.commit()
-        token = create_token(user)
-        res = {"token": token, "user": {"id": user.id, "email": user.email, "name": user.name, "picture": user.picture, "hospital": user.hospital}}
-        session.close()
-        return jsonify(res)
-    except Exception as e:
-        return jsonify({"message": f"Google token invalid: {str(e)}"}), 401
-
-@app.post("/api/auth/dev-login")
-def dev_login():
-    data = request.get_json() or {}
-    email = (data.get("email") or "").strip().lower()
-    hospital = (data.get("hospital") or "").strip()
-    name = (data.get("name") or (email.split("@")[0] if email else "")).strip()
-    if not email or not hospital:
-        return jsonify({"message": "email and hospital are required"}), 400
-    s = SessionLocal()
-    try:
-        user = s.query(User).filter_by(email=email).first()
-        if not user:
-            user = User(email=email, name=name or "Doctor", picture="", hospital=hospital)
-            s.add(user)
-            s.commit()
-        else:
-            user.name = name or user.name
-            user.hospital = hospital or user.hospital
-            user.last_login = dt.datetime.utcnow()
-            s.commit()
-        token = create_token(user)
-        return jsonify({"token": token, "user": {"id": user.id, "email": user.email, "name": user.name, "hospital": user.hospital, "picture": user.picture}})
-    finally:
-        s.close()
-
-@app.get("/api/threads")
-@login_required
-def list_threads():
-    s = request.dbs
-    u = request.user
-    q = s.query(Thread).filter_by(user_id=u.id)
-    status = request.args.get("status")
-    if status in ("open", "closed"):
-        q = q.filter(Thread.status == status)
-    threads = q.order_by(Thread.updated_at.desc()).all()
-    return jsonify([{"id": t.id, "title": t.title, "status": t.status, "created_at": t.created_at.isoformat(), "updated_at": t.updated_at.isoformat(), "ended_at": t.ended_at.isoformat() if t.ended_at else None} for t in threads])
-
-@app.post("/api/threads")
-@login_required
-def create_thread():
-    s = request.dbs
-    u = request.user
-    payload = request.get_json() or {}
-    title = (payload.get("title") or "").strip()
-    if not title:
-        count = s.query(Thread).filter_by(user_id=u.id).count()
-        title = f"Patient {count + 1}"
-    t = Thread(user_id=u.id, title=title, status="open")
-    s.add(t)
-    s.commit()
-    return jsonify({"id": t.id, "title": t.title, "status": t.status, "created_at": t.created_at.isoformat(), "updated_at": t.updated_at.isoformat(), "ended_at": None}), 201
-
-@app.get("/api/threads/<int:tid>")
-@login_required
-def get_thread(tid):
-    s = request.dbs
-    t = s.get(Thread, tid)
-    if not t or t.user_id != request.user.id:
-        return jsonify({"message": "Not found"}), 404
-    return jsonify({"id": t.id, "title": t.title, "status": t.status, "created_at": t.created_at.isoformat(), "updated_at": t.updated_at.isoformat(), "ended_at": t.ended_at.isoformat() if t.ended_at else None})
-
-@app.get("/api/threads/<int:tid>/messages")
-@login_required
-def list_messages(tid):
-    s = request.dbs
-    t = s.get(Thread, tid)
-    if not t or t.user_id != request.user.id:
-        return jsonify({"message": "Not found"}), 404
-    return jsonify([{"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat()} for m in t.messages])
-
-@app.post("/api/threads/<int:tid>/messages")
-@login_required
-def post_message(tid):
-    s = request.dbs
-    t = s.get(Thread, tid)
-    if not t or t.user_id != request.user.id:
-        return jsonify({"message": "Not found"}), 404
-    if t.status == "closed":
-        return jsonify({"message": "Thread is closed"}), 409
-    data = request.get_json() or {}
-    role = data.get("role")
-    content = (data.get("content") or "").strip()
-    if role not in ("doctor", "patient") or not content:
-        return jsonify({"message": "Invalid payload"}), 400
-    dm = Message(thread_id=t.id, role=role, content=content)
-    s.add(dm)
-    if role == "doctor":
-        conversation_history = s.query(Message).filter_by(thread_id=t.id).order_by(Message.created_at.asc()).all()
-        reply = simulate_patient_reply(prompt=content, conversation_history=conversation_history)
-        pm = Message(thread_id=t.id, role="patient", content=reply)
-        s.add(pm)
-    t.updated_at = dt.datetime.utcnow()
-    s.commit()
-    msgs = s.query(Message).filter_by(thread_id=t.id).order_by(Message.created_at.asc()).all()
-    return jsonify([{"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat()} for m in msgs]), 201
-
-@app.get("/api/messages/<int:msg_id>/speech")
-@login_required
-def get_message_speech(msg_id):
-    """Generate and return speech audio for patient message"""
-    s = request.dbs
-    msg = s.get(Message, msg_id)
-    
-    if not msg:
-        return jsonify({"message": "Message not found"}), 404
-    
-    thread = s.get(Thread, msg.thread_id)
-    if not thread or thread.user_id != request.user.id:
-        return jsonify({"message": "Unauthorized"}), 403
-    
-    if msg.role != "patient":
-        return jsonify({"message": "Only patient messages have speech"}), 400
-    
-    try:
-        print(f"📡 Speech request for message {msg_id}: {msg.content[:50]}...")
-        audio_bytes = generate_speech_elevenlabs(msg.content)
-        return send_file(
-            BytesIO(audio_bytes),
-            mimetype="audio/mpeg",
-            as_attachment=False,
-            download_name=f"patient_{msg_id}.mp3"
-        )
-    except Exception as e:
-        error_msg = str(e)
-        print(f"❌ Speech generation failed: {error_msg}")
-        return jsonify({"message": f"Speech generation failed: {error_msg}"}), 500
-
-@app.patch("/api/threads/<int:tid>")
-@login_required
-def rename_thread(tid):
-    s = request.dbs
-    t = s.get(Thread, tid)
-    if not t or t.user_id != request.user.id:
-        return jsonify({"message": "Not found"}), 404
-    data = request.get_json() or {}
-    new_title = (data.get("title") or "").strip()
-    if not new_title:
-        return jsonify({"message": "title is required"}), 400
-    t.title = new_title
-    t.updated_at = dt.datetime.utcnow()
-    s.commit()
-    return jsonify({"id": t.id, "title": t.title, "status": t.status, "created_at": t.created_at.isoformat(), "updated_at": t.updated_at.isoformat(), "ended_at": t.ended_at.isoformat() if t.ended_at else None})
-
-@app.delete("/api/threads/<int:tid>")
-@login_required
-def delete_thread(tid):
-    s = request.dbs
-    t = s.get(Thread, tid)
-    if not t or t.user_id != request.user.id:
-        return jsonify({"message": "Not found"}), 404
-    s.delete(t)
-    s.commit()
-    return jsonify({"ok": True})
-
-@app.post("/api/threads/<int:tid>/end")
-@login_required
-def end_thread(tid):
-    s = request.dbs
-    t = s.get(Thread, tid)
-    if not t or t.user_id != request.user.id:
-        return jsonify({"message": "Not found"}), 404
-
-    # If already closed and feedback exists, just return it
-    if t.status == "closed" and t.feedback:
-        fb = t.feedback
-        return jsonify({
-            "thread": {
-                "id": t.id, "title": t.title, "status": t.status,
-                "created_at": t.created_at.isoformat(),
-                "updated_at": t.updated_at.isoformat(),
-                "ended_at": t.ended_at.isoformat() if t.ended_at else None
-            },
-            "feedback": {
-                "feedback_text": fb.feedback_text,
-                "overall_score": fb.overall_score,
-                "rubric": fb.rubric_json,
-                "created_at": fb.created_at.isoformat()
-            }
-        }), 200
-
-    # Generate once
-    fb_dict = generate_feedback_for_thread(tid)
-
-    # Close thread
-    t.status = "closed"
-    t.ended_at = dt.datetime.utcnow()
-    t.updated_at = dt.datetime.utcnow()
-
-    # Upsert feedback exactly once
-    payload_json = json.dumps(fb_dict, ensure_ascii=False)
-    fb = None
-    if t.feedback:
-        t.feedback.feedback_text = fb_dict.get("feedback_text", "")
-        t.feedback.overall_score = int(fb_dict.get("overall_score", 0))
-        t.feedback.rubric_json = payload_json
-        t.feedback.created_at = dt.datetime.utcnow()
-        fb = t.feedback
-    else:
-        fb = Feedback(
-            thread_id=t.id,
-            feedback_text=fb_dict.get("feedback_text", ""),
-            overall_score=int(fb_dict.get("overall_score", 0)),
-            rubric_json=payload_json,
-            created_at=dt.datetime.utcnow()
-        )
-        s.add(fb)
-
-    s.commit()
-
-    # fb = t.feedback  # refreshed
-    return jsonify({
-        "thread": {
-            "id": t.id, "title": t.title, "status": t.status,
-            "created_at": t.created_at.isoformat(),
-            "updated_at": t.updated_at.isoformat(),
-            "ended_at": t.ended_at.isoformat() if t.ended_at else None
-        },
-        "feedback": {
-            "feedback_text": fb.feedback_text,
-            "overall_score": fb.overall_score,
-            "rubric": fb.rubric_json,
-            "created_at": fb.created_at.isoformat()
-        }
-    }), 200
-
-@app.get("/api/threads/<int:tid>/feedback")
-@login_required
-def get_feedback(tid):
-    s = request.dbs
-    t = s.get(Thread, tid)
-    if not t or t.user_id != request.user.id:
-        return jsonify({"message": "Not found"}), 404
-    if t.status != "closed" or not t.feedback:
-        return jsonify({"message": "Feedback not available"}), 404
-    fb = t.feedback
-    return jsonify({"overall_score": fb.overall_score, "rubric": fb.rubric_json, "created_at": fb.created_at.isoformat()})
-
-def simulate_patient_reply(prompt: str, conversation_history: List[Message] = None) -> str:
-    """Generate patient reply using Gemini AI"""
+# --- GEMINI SIMULATION ---
+def simulate_patient_reply(prompt: str, conversation_history: List[dict] = None) -> str:
     if not GCP_PROJECT_ID:
-        print("⚠ Vertex AI not configured, using fallback")
         p = prompt.lower()
         if any(k in p for k in ["pain", "ache", "hurt"]):
             return "I've had a dull ache for about 3 days. It gets worse when I move."
@@ -521,22 +127,290 @@ def simulate_patient_reply(prompt: str, conversation_history: List[Message] = No
     try:
         context = ""
         if conversation_history:
-            context = "Conversation history:\n"
             for msg in conversation_history:
-                role_label = "Doctor" if msg.role == "doctor" else "Patient"
-                context += f"{role_label}: {msg.content}\n"
-            context += "\n"
-        full_prompt = f"{context}{prompt}\n"
+                role = msg["role"].capitalize()
+                context += f"{role}: {msg['content']}\n"
+        full_prompt = f"{context}\nDoctor: {prompt}\n"
         contents = [Content(role="user", parts=[Part.from_text(text=full_prompt)])]
-        response = client.models.generate_content(model=TUNED_MODEL, contents=contents, config=GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, temperature=0.3))
-        if not response or not response.text:
-            return "I'm not sure how to respond to that." 
-        return response.text.strip()
+        response = genai_client.models.generate_content(
+            model=TUNED_MODEL,
+            contents=contents,
+            config=GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                temperature=0.3,
+            ),
+        )
+        return response.text.strip() if response and response.text else "I'm not sure how to respond to that."
     except Exception as e:
-        print(f"⚠ Vertex AI error: {e}")
-        import traceback
-        traceback.print_exc()
-        return "I'm having trouble expressing myself. Could you rephrase?"
+        print(f"⚠️ Gemini error: {e}")
+        return "I'm having trouble expressing myself right now."
+
+
+# --- FEEDBACK ---
+def generate_feedback_for_thread(user_id: str, thread_id: str) -> dict:
+    msgs_ref = (
+        db.collection("users")
+          .document(user_id)
+          .collection("threads")
+          .document(thread_id)
+          .collection("messages")
+    )
+    messages = [
+        {"role": m.get("role"), "content": m.get("content")}
+        for m in (msg.to_dict() for msg in msgs_ref.order_by("created_at").stream())
+    ]
+    return generate_feedback_json_with_model_v2(messages)
+
+
+def _iso(dtobj):
+    # Firestore returns datetime objects; make them JSON-safe
+    if isinstance(dtobj, dt.datetime):
+        return dtobj.isoformat()
+    return dtobj or None
+
+
+# --- API ROUTES ---
+
+
+@app.get("/api/threads/<thread_id>")
+@login_required
+def get_thread(thread_id):
+    thread_ref = (
+        db.collection("users")
+          .document(request.user_id)
+          .collection("threads")
+          .document(thread_id)
+    )
+    doc = thread_ref.get()
+    if not doc.exists:
+        return jsonify({"message": "Not found"}), 404
+
+    data = doc.to_dict() or {}
+    return jsonify({
+        "id": thread_id,
+        "title": data.get("title", "New Patient Session"),
+        "status": data.get("status", "open"),
+        "created_at": _iso(data.get("created_at")),
+        "updated_at": _iso(data.get("updated_at")),
+        "ended_at": _iso(data.get("ended_at")),
+    })
+
+@app.post("/api/auth/google-login")
+def google_login():
+    data = request.get_json() or {}
+    idtok = data.get("id_token")
+    hospital = data.get("hospital")
+    if not idtok or not hospital:
+        return jsonify({"message": "Missing id_token or hospital"}), 400
+    try:
+        ginfo = id_token.verify_oauth2_token(idtok, grequests.Request(), GOOGLE_CLIENT_ID)
+        email = ginfo["email"]
+        name = ginfo.get("name", email.split("@")[0])
+        picture = ginfo.get("picture", "")
+
+        users_ref = db.collection("users")
+        query = users_ref.where("email", "==", email).limit(1).stream()
+        user_doc = next(query, None)
+        if user_doc:
+            uid = user_doc.id
+            users_ref.document(uid).update({
+                "name": name,
+                "picture": picture,
+                "hospital": hospital,
+                "last_login": dt.datetime.utcnow(),
+            })
+        else:
+            new_doc = users_ref.document()
+            uid = new_doc.id
+            new_doc.set({
+                "email": email,
+                "name": name,
+                "picture": picture,
+                "hospital": hospital,
+                "created_at": dt.datetime.utcnow(),
+                "last_login": dt.datetime.utcnow(),
+            })
+
+        token = create_token(uid, email)
+        return jsonify({
+            "token": token,
+            "user": {"id": uid, "email": email, "name": name, "picture": picture, "hospital": hospital}
+        })
+    except Exception as e:
+        return jsonify({"message": f"Google token invalid: {str(e)}"}), 401
+
+
+@app.post("/api/auth/dev-login")
+def dev_login():
+    data = request.get_json() or {}
+    email = data.get("email")
+    hospital = data.get("hospital")
+    if not email or not hospital:
+        return jsonify({"message": "email and hospital required"}), 400
+    users_ref = db.collection("users")
+    query = users_ref.where("email", "==", email).limit(1).stream()
+    user_doc = next(query, None)
+    if user_doc:
+        uid = user_doc.id
+    else:
+        new_doc = users_ref.document()
+        uid = new_doc.id
+        new_doc.set({
+            "email": email,
+            "name": email.split("@")[0],
+            "hospital": hospital,
+            "created_at": dt.datetime.utcnow(),
+            "last_login": dt.datetime.utcnow(),
+        })
+    token = create_token(uid, email)
+    return jsonify({
+        "token": token,
+        "user": {"id": uid, "email": email, "name": email.split('@')[0], "hospital": hospital}
+    })
+
+
+@app.get("/api/threads")
+@login_required
+def list_threads():
+    threads_ref = db.collection("users").document(request.user_id).collection("threads")
+    status = request.args.get("status")
+    q = threads_ref
+    if status:
+        q = q.where("status", "==", status)
+    threads = [{"id": t.id, **t.to_dict()} for t in q.stream()]
+    return jsonify(threads)
+
+
+@app.post("/api/threads")
+@login_required
+def create_thread():
+    threads_ref = db.collection("users").document(request.user_id).collection("threads")
+    data = request.get_json() or {}
+    title = (data.get("title") or "").strip()
+    if not title:
+        count = len(list(threads_ref.stream()))
+        title = f"Patient {count + 1}"
+    thread_doc = threads_ref.document()
+    thread_doc.set({
+        "title": title,
+        "status": "open",
+        "created_at": dt.datetime.utcnow(),
+        "updated_at": dt.datetime.utcnow(),
+    })
+    return jsonify({"id": thread_doc.id, "title": title, "status": "open"}), 201
+
+@app.get("/api/threads/<thread_id>/messages")
+@login_required
+def list_messages(thread_id):
+    thread_ref = (
+        db.collection("users")
+          .document(request.user_id)
+          .collection("threads")
+          .document(thread_id)
+    )
+    if not thread_ref.get().exists:
+        return jsonify({"message": "Not found"}), 404
+
+    msgs_ref = thread_ref.collection("messages").order_by("created_at")
+    messages = []
+    for snap in msgs_ref.stream():
+        d = snap.to_dict() or {}
+        messages.append({
+            "id": snap.id,
+            "role": d.get("role"),
+            "content": d.get("content"),
+            "created_at": _iso(d.get("created_at")),
+        })
+
+    return jsonify(messages)
+
+@app.post("/api/threads/<thread_id>/messages")
+@login_required
+def post_message(thread_id):
+    threads_ref = db.collection("users").document(request.user_id).collection("threads").document(thread_id)
+    if not threads_ref.get().exists:
+        return jsonify({"message": "Thread not found"}), 404
+
+    data = request.get_json() or {}
+    role = data.get("role")
+    content = (data.get("content") or "").strip()
+    if role not in ("doctor", "patient") or not content:
+        return jsonify({"message": "Invalid payload"}), 400
+
+    msg_ref = threads_ref.collection("messages").document()
+    msg_ref.set({
+        "role": role,
+        "content": content,
+        "created_at": dt.datetime.utcnow(),
+    })
+
+    if role == "doctor":
+        messages = [{"role": m.get("role"), "content": m.get("content")} for m in (x.to_dict() for x in threads_ref.collection("messages").order_by("created_at").stream())]
+        reply = simulate_patient_reply(content, messages)
+        threads_ref.collection("messages").document().set({
+            "role": "patient",
+            "content": reply,
+            "created_at": dt.datetime.utcnow(),
+        })
+
+    threads_ref.update({"updated_at": dt.datetime.utcnow()})
+    messages = [{"id": m.id, **m.to_dict()} for m in threads_ref.collection("messages").order_by("created_at").stream()]
+    return jsonify(messages), 201
+
+
+@app.post("/api/threads/<thread_id>/end")
+@login_required
+def end_thread(thread_id):
+    thread_ref = db.collection("users").document(request.user_id).collection("threads").document(thread_id)
+    thread = thread_ref.get()
+    if not thread.exists:
+        return jsonify({"message": "Not found"}), 404
+
+    fb_ref = thread_ref.collection("feedback").document("latest")
+    fb_dict = generate_feedback_for_thread(request.user_id, thread_id)
+    thread_ref.update({
+        "status": "closed",
+        "ended_at": dt.datetime.utcnow(),
+        "updated_at": dt.datetime.utcnow()
+    })
+    fb_ref.set({
+        "feedback_text": fb_dict["feedback_text"],
+        "overall_score": fb_dict["overall_score"],
+        "rubric_json": fb_dict["sections"],
+        "created_at": dt.datetime.utcnow(),
+    })
+    return jsonify({
+        "thread": {"id": thread_id, "status": "closed"},
+        "feedback": fb_dict
+    }), 200
+
+
+@app.get("/api/threads/<thread_id>/feedback")
+@login_required
+def get_feedback(thread_id):
+    fb_ref = (
+        db.collection("users")
+          .document(request.user_id)
+          .collection("threads")
+          .document(thread_id)
+          .collection("feedback")
+          .document("latest")
+    )
+    fb = fb_ref.get()
+    if not fb.exists:
+        return jsonify({"message": "Feedback not available"}), 404
+    return jsonify(fb.to_dict())
+
+
+@app.get("/api/messages/<msg_id>/speech")
+@login_required
+def get_message_speech(msg_id):
+    try:
+        audio_bytes = generate_speech_elevenlabs("Audio playback simulation")
+        return send_file(BytesIO(audio_bytes), mimetype="audio/mpeg", as_attachment=False)
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+
 
 @app.get("/")
 def home():
@@ -550,6 +424,7 @@ def home():
     else:
         status.append("Gemini AI ❌")
     return f"<h1>MediSim API</h1><p>Status: {' | '.join(status)}</p>"
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5001"))

@@ -3,10 +3,12 @@ import { useAuth } from '../auth/AuthContext.jsx'
 import { api, setAuthToken } from '../lib/api.js'
 import Sidebar from '../ui/Sidebar.jsx'
 import ChatArea from '../ui/ChatArea.jsx'
+import { useParams } from 'react-router-dom';
 
 export default function ChatLayout() {
   const { token, user } = useAuth()
   const [threads, setThreads] = useState([])
+  const { threadId } = useParams(); 
   const [activeId, setActiveId] = useState(null)
   const [activeMeta, setActiveMeta] = useState(null)
 
@@ -14,6 +16,10 @@ export default function ChatLayout() {
     setAuthToken(token)
     fetchThreads()
   }, [token])
+
+  useEffect(() => {
+    setActiveId(threadId || null);
+  }, [threadId]);
 
   async function fetchThreads() {
     const res = await api.get('/threads')
@@ -24,6 +30,7 @@ export default function ChatLayout() {
   }
 
   useEffect(() => {
+    console.log('Active id updated')
     if (!activeId) { setActiveMeta(null); return }
     api.get(`/threads/${activeId}`).then(r => setActiveMeta(r.data))
   }, [activeId])
