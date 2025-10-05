@@ -14,7 +14,7 @@ export default function ChatLayout() {
   const [activeMeta, setActiveMeta] = useState(null)
 
   useEffect(() => {
-    setAuthToken(token)
+    // Token is auto-set in AuthContext, just fetch threads
     fetchThreads()
   }, [token])
 

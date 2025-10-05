@@ -1,5 +1,6 @@
+// frontend/src/auth/AuthContext.jsx - FIXED
 import React, { createContext, useEffect, useState } from 'react'
-// import jwt_decode from 'jwt-decode'
+import { setAuthToken } from '../lib/api.js'
 
 export const AuthContext = createContext(null)
 
@@ -9,19 +10,29 @@ export function AuthProvider({ children }) {
     JSON.parse(localStorage.getItem('user') || 'null')
   )
 
+  // ✅ Set token on axios instance whenever token changes
   useEffect(() => {
-    if (token) localStorage.setItem('token', token)
-    else localStorage.removeItem('token')
+    if (token) {
+      localStorage.setItem('token', token)
+      setAuthToken(token) // 🔑 AUTO-SET TOKEN ON API CLIENT
+    } else {
+      localStorage.removeItem('token')
+      setAuthToken(null) // Clear token from API client
+    }
   }, [token])
 
   useEffect(() => {
-    if (user) localStorage.setItem('user', JSON.stringify(user))
-    else localStorage.removeItem('user')
+    if (user) {
+      localStorage.setItem('user', JSON.stringify(user))
+    } else {
+      localStorage.removeItem('user')
+    }
   }, [user])
 
   const logout = () => {
     setToken(null)
     setUser(null)
+    setAuthToken(null) // Clear token from API client on logout
   }
 
   return (
