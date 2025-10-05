@@ -405,11 +405,59 @@ def get_feedback(thread_id):
 @app.get("/api/messages/<msg_id>/speech")
 @login_required
 def get_message_speech(msg_id):
+    """
+    Look up the message under the current user's threads in Firestore,
+    ensure it's a patient message, then return ElevenLabs TTS audio.
+    """
     try:
-        audio_bytes = generate_speech_elevenlabs("Audio playback simulation")
-        return send_file(BytesIO(audio_bytes), mimetype="audio/mpeg", as_attachment=False)
+        user_ref = db.collection("users").document(request.user_id)
+        threads_ref = user_ref.collection("threads")
+
+        found_data = None
+
+        # Search each thread's messages for this message ID
+        for thread_snap in threads_ref.stream():
+            msg_snap = (
+                threads_ref
+                .document(thread_snap.id)
+                .collection("messages")
+                .document(msg_id)
+                .get()
+            )
+            if msg_snap.exists:
+                found_data = msg_snap.to_dict() or {}
+                break
+
+        if not found_data:
+            return jsonify({"message": "Message not found"}), 404
+
+        # Only patient messages are allowed for TTS
+        if found_data.get("role") != "patient":
+            return jsonify({"message": "Only patient messages have speech"}), 400
+
+        text = (found_data.get("content") or "").strip()
+        if not text:
+            return jsonify({"message": "Message has no content"}), 400
+
+        # If you implemented expressions, this will use them; otherwise we fall back.
+        try:
+            expression = found_data.get("expression")  # may be None for older messages
+            audio_bytes = generate_speech_elevenlabs_expressive(text, expression)
+        except NameError:
+            # expressive helper not defined → use the basic TTS
+            audio_bytes = generate_speech_elevenlabs(text)
+
+        return send_file(
+            BytesIO(audio_bytes),
+            mimetype="audio/mpeg",
+            as_attachment=False,
+            download_name=f"patient_{msg_id}.mp3"
+        )
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        print(f"❌ ElevenLabs error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Speech generation failed: {str(e)}"}), 500
 
 
 @app.get("/")
