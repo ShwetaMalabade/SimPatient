@@ -12,6 +12,8 @@ import {
   PhoneOff
 } from 'lucide-react'
 import FeedbackCard from './FeedbackCard.jsx'
+import Modal from './Modal.jsx'
+import { useModal } from '../hooks/useModal.js'
 import { useSpeech } from '../hooks/useSpeech.js'
 import { useVUMeter } from '../hooks/useVUMeter.js'
 
@@ -23,13 +25,15 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
   const [feedback, setFeedback] = useState(null)
   const [voiceMode, setVoiceMode] = useState(false)
   const [audioPlaying, setAudioPlaying] = useState(false)
-  const [evaluating, setEvaluating] = useState(false) // ⬅️ NEW
+  const [evaluating, setEvaluating] = useState(false)
 
   const scrollRef = useRef(null)
   const lastSpokenIdRef = useRef(null)
   const audioRef = useRef(null)
   const tokenRef = useRef(localStorage.getItem('token'))
   const voiceModeRef = useRef(false)
+
+  const { modalState, closeModal, confirm, alert, error } = useModal()
 
   useEffect(() => {
     voiceModeRef.current = voiceMode
@@ -55,7 +59,7 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [messages,feedback])
+  }, [messages, feedback])
 
   useEffect(() => {
     if (meta) {
@@ -143,7 +147,6 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     }
   }
 
-  // ---- Optimistic send with typing indicator ----
   async function sendText(text) {
     if (!text || status === 'closed') return
     const content = text.trim()
@@ -176,7 +179,7 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     } catch (err) {
       console.error('❌ Send failed:', err)
       setMessages(prev => prev.filter(m => m.id !== optimisticId && m.id !== 'typing'))
-      alert('Failed to send message: ' + err.message)
+      await error('Send Failed', 'Failed to send message: ' + err.message)
     }
   }
 
@@ -186,60 +189,55 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     await sendText(text)
   }
 
-  // async function endDiagnosis() {
-  //   const ok = confirm("End this session and generate feedback?")
-  //   if (!ok) return
-
-  //   setEvaluating(true) // ⬅️ show overlay
-  //   try {
-  //     const res = await api.post(`/threads/${threadId}/end`, {})
-  //     onEnded?.(res.data)
-  //     setStatus('closed')
-  //     await loadFeedback()
-  //     if (voiceMode) endVoice()
-  //   } catch (err) {
-  //     console.error('❌ End session failed:', err)
-  //     alert('Failed to end session: ' + err.message)
-  //   } finally {
-  //     setEvaluating(false) // ⬅️ hide overlay
-  //   }
-  // }
-
   async function endDiagnosis() {
-    // Check if there are any doctor messages
     const doctorMessages = messages.filter(m => m.role === 'doctor' && !m.typing)
     
+    let shouldContinue = false
+    
     if (doctorMessages.length < 2) {
-      const confirmDelete = confirm(
-        "This session has very little conversation. It will be deleted instead of evaluated. Continue?"
+      shouldContinue = await confirm(
+        'Delete Empty Session?',
+        'This session has very little conversation. It will be deleted instead of evaluated. Do you want to continue?'
       )
-      if (!confirmDelete) return
     } else {
-      const confirmEnd = confirm("End this session and generate feedback?")
-      if (!confirmEnd) return
+      shouldContinue = await confirm(
+        'End Diagnosis Session?',
+        'Are you sure you want to end this session and generate feedback? This action cannot be undone.'
+      )
     }
-  
+
+    if (!shouldContinue) return
+
     setEvaluating(true)
     try {
       const res = await api.post(`/threads/${threadId}/end`, {})
       
-      // Check if thread was deleted (empty session)
       if (res.data.deleted) {
-        alert('Session deleted - please start a new conversation with more dialogue for evaluation.')
-        // Redirect to new chat
+        await alert(
+          'Session Deleted',
+          'Session deleted successfully. Please start a new conversation with more dialogue for evaluation.',
+          'success'
+        )
         window.location.href = '/newchat'
         return
       }
       
-      // Normal feedback flow
       onEnded?.(res.data)
       setStatus('closed')
       await loadFeedback()
       if (voiceMode) endVoice()
       
+      await alert(
+        'Feedback Generated!',
+        'Your session has been evaluated. Check the feedback below.',
+        'success'
+      )
     } catch (err) {
       console.error('❌ End session failed:', err)
-      alert('Failed to end session: ' + (err.response?.data?.message || err.message))
+      await error(
+        'Session End Failed',
+        err.response?.data?.message || err.message || 'Failed to end session. Please try again.'
+      )
     } finally {
       setEvaluating(false)
     }
@@ -306,7 +304,6 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
   }
 
   return (
-    // Make container relative so the overlay can absolutely cover it
     <div className="flex-1 h-full flex flex-col relative">
       <div className="px-6 py-3 border-b border-slate-200 bg-white/70 backdrop-blur-sm flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
@@ -399,7 +396,6 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
         </div>
       </div>
 
-      {/* ▶ Evaluating overlay */}
       {evaluating && (
         <div className="absolute inset-0 z-40 bg-white/70 backdrop-blur-sm flex items-center justify-center">
           <div className="flex items-center gap-3 px-4 py-3 rounded-2xl border border-slate-200 bg-white shadow-soft">
@@ -463,6 +459,18 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
           </div>
         </div>
       )}
+
+      <Modal
+        isOpen={modalState.isOpen}
+        onClose={closeModal}
+        title={modalState.title}
+        message={modalState.message}
+        type={modalState.type}
+        confirmText={modalState.confirmText}
+        cancelText={modalState.cancelText}
+        showCancel={modalState.showCancel}
+        onConfirm={modalState.onConfirm}
+      />
     </div>
   )
 }
