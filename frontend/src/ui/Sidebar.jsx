@@ -2,6 +2,7 @@ import React from 'react'
 import { Plus, Stethoscope, LogOut, Lock } from 'lucide-react'
 import { useAuth } from '../auth/AuthContext.jsx'
 import { useNavigate } from 'react-router-dom'
+import defaultProfile from '../images/default-profile.webp'
 
 export default function Sidebar({ user, threads, activeId }) {
   const { logout } = useAuth()
@@ -13,7 +14,7 @@ export default function Sidebar({ user, threads, activeId }) {
     <div className="w-[300px] h-full bg-white/80 border-r border-slate-200 p-3 flex flex-col gap-3">
       {/* Profile */}
       <div className="rounded-2xl p-3 bg-gradient-to-br from-brand-50 to-white border border-brand-100 shadow-soft flex items-center gap-3">
-        <img src={user?.picture} className="w-10 h-10 rounded-xl object-cover border border-brand-100" alt="pfp" />
+        <img src={user?.picture || defaultProfile} className="w-10 h-10 rounded-xl object-cover border border-brand-100" alt="pfp" />
         <div className="flex-1 min-w-0">
           <div className="text-sm font-semibold truncate">{user?.name}</div>
           <div className="text-xs text-slate-600 truncate">{user?.hospital}</div>

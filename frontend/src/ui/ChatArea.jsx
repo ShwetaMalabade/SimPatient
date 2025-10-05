@@ -1,4 +1,4 @@
-// src/ui/ChatArea.jsx - FULLY WORKING VERSION
+// src/ui/ChatArea.jsx
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { api } from '../lib/api.js'
 import { API_BASE } from '../lib/config.js'
@@ -23,6 +23,7 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
   const [feedback, setFeedback] = useState(null)
   const [voiceMode, setVoiceMode] = useState(false)
   const [audioPlaying, setAudioPlaying] = useState(false)
+  const [evaluating, setEvaluating] = useState(false) // ⬅️ NEW
 
   const scrollRef = useRef(null)
   const lastSpokenIdRef = useRef(null)
@@ -30,37 +31,20 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
   const tokenRef = useRef(localStorage.getItem('token'))
   const voiceModeRef = useRef(false)
 
-  // Sync voiceMode ref
   useEffect(() => {
     voiceModeRef.current = voiceMode
-    console.log('Voice mode changed:', voiceMode)
   }, [voiceMode])
 
-  // Speech recognition
   const { supported: sttSupported, listening, interim, start, stop } = useSpeech({
     silenceMs: 3500
   })
 
   const { level } = useVUMeter(voiceMode && listening)
 
-  // Final text handler - MUST be stable reference
   const handleFinalText = useCallback((text) => {
-    console.log('🎯 handleFinalText called with:', text)
-    console.log('   voiceModeRef.current:', voiceModeRef.current)
-    
-    if (!voiceModeRef.current) {
-      console.log('   ❌ Voice mode is OFF, ignoring')
-      return
-    }
-    
-    if (!text) {
-      console.log('   ❌ Empty text, ignoring')
-      return
-    }
-    
-    console.log('   ✅ Sending message...')
+    if (!voiceModeRef.current || !text) return
     sendText(text)
-  }, []) // No dependencies - stable reference
+  }, [])
 
   useEffect(() => {
     if (!threadId) return
@@ -71,7 +55,7 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [messages])
+  }, [messages,feedback])
 
   useEffect(() => {
     if (meta) {
@@ -81,100 +65,56 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     }
   }, [meta])
 
-  // Play patient audio when new message arrives
   useEffect(() => {
-    if (!voiceModeRef.current) {
-      console.log('⏭️ Voice mode OFF, not playing audio')
-      return
-    }
-
-    console.log('🔍 Checking messages for patient response...', messages.length)
-    
-    const patientMessages = messages.filter(m => m.role === 'patient')
-    console.log('   Patient messages:', patientMessages.length)
-    
-    if (patientMessages.length === 0) {
-      console.log('   No patient messages yet')
-      return
-    }
-    
+    if (!voiceModeRef.current) return
+    const patientMessages = messages.filter(m => m.role === 'patient' && !m.typing)
+    if (patientMessages.length === 0) return
     const lastPatient = patientMessages[patientMessages.length - 1]
-    
-    if (lastPatient.id === lastSpokenIdRef.current) {
-      console.log('   Already played:', lastPatient.id)
-      return
-    }
-    
-    console.log('   🎤 NEW PATIENT MESSAGE! Playing:', lastPatient.id)
+    if (!lastPatient.id || lastPatient.id === lastSpokenIdRef.current) return
     lastSpokenIdRef.current = lastPatient.id
     playPatientAudio(lastPatient.id)
   }, [messages])
 
   async function playPatientAudio(messageId) {
     try {
-      console.log('🔊 Fetching audio for message:', messageId)
-      
-      if (listening) {
-        console.log('⏸️ Stopping mic')
-        stop()
-      }
-
+      if (listening) stop()
       if (audioRef.current) {
         audioRef.current.pause()
         audioRef.current = null
       }
-
       setAudioPlaying(true)
-
       const response = await fetch(`${API_BASE}/messages/${messageId}/speech`, {
         headers: { 'Authorization': `Bearer ${tokenRef.current}` }
       })
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`)
-      }
-
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const audioBlob = await response.blob()
-      console.log('📦 Got audio blob:', audioBlob.size, 'bytes')
-      
       const audioUrl = URL.createObjectURL(audioBlob)
       const audio = new Audio(audioUrl)
       audioRef.current = audio
 
       audio.onended = () => {
-        console.log('🎵 Audio finished')
         setAudioPlaying(false)
         URL.revokeObjectURL(audioUrl)
         audioRef.current = null
-
         if (voiceModeRef.current && status === 'open') {
-          console.log('🎤 Resuming mic...')
           setTimeout(() => {
-            if (voiceModeRef.current) {
-              start({ onFinalText: handleFinalText })
-            }
+            if (voiceModeRef.current) start({ onFinalText: handleFinalText })
           }, 1000)
         }
       }
 
-      audio.onerror = (e) => {
-        console.error('❌ Audio error:', e)
+      audio.onerror = () => {
         setAudioPlaying(false)
         URL.revokeObjectURL(audioUrl)
         audioRef.current = null
-        
         if (voiceModeRef.current && status === 'open') {
           setTimeout(() => start({ onFinalText: handleFinalText }), 500)
         }
       }
 
-      console.log('▶️ Playing audio...')
       await audio.play()
-      
-    } catch (err) {
-      console.error('❌ Playback error:', err)
+    } catch {
       setAudioPlaying(false)
-      
       if (voiceModeRef.current && status === 'open') {
         setTimeout(() => start({ onFinalText: handleFinalText }), 500)
       }
@@ -186,11 +126,8 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
       const t = await api.get(`/threads/${threadId}`)
       setTitle(t.data.title)
       setStatus(t.data.status)
-      
       const res = await api.get(`/threads/${threadId}/messages`)
-      console.log('📥 Loaded messages:', res.data.length)
       setMessages(res.data)
-      
       if (t.data.status === 'closed') loadFeedback()
     } catch (err) {
       console.error('❌ Load error:', err)
@@ -206,63 +143,78 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     }
   }
 
+  // ---- Optimistic send with typing indicator ----
   async function sendText(text) {
-    if (!text || status === 'closed') {
-      console.log('❌ Cannot send:', { text, status })
-      return
-    }
-    
+    if (!text || status === 'closed') return
     const content = text.trim()
-    if (!content) {
-      console.log('❌ Empty content')
-      return
+    if (!content) return
+
+    const optimisticId = `temp-${Date.now()}`
+    const optimisticMsg = {
+      id: optimisticId,
+      role: 'doctor',
+      content,
+      created_at: new Date().toISOString()
+    }
+    const typingMsg = {
+      id: 'typing',
+      role: 'patient',
+      content: '…',
+      typing: true,
+      created_at: new Date().toISOString()
     }
 
-    console.log('📤 Sending:', content)
+    setMessages(prev => [...prev, optimisticMsg, typingMsg])
+    setInput('')
 
     try {
       const res = await api.post(`/threads/${threadId}/messages`, {
         role: 'doctor',
         content
       })
-      
-      console.log('✅ Response received:', res.data.length, 'messages')
       setMessages(res.data)
-      
     } catch (err) {
       console.error('❌ Send failed:', err)
+      setMessages(prev => prev.filter(m => m.id !== optimisticId && m.id !== 'typing'))
       alert('Failed to send message: ' + err.message)
     }
   }
 
   async function send() {
-    await sendText(input)
+    const text = input
     setInput('')
+    await sendText(text)
   }
 
   async function endDiagnosis() {
     const ok = confirm("End this session and generate feedback?")
     if (!ok) return
 
-    const res = await api.post(`/threads/${threadId}/end`, {})
-    onEnded?.(res.data)
-    setStatus('closed')
-    await loadFeedback()
-
-    if (voiceMode) endVoice()
+    setEvaluating(true) // ⬅️ show overlay
+    try {
+      const res = await api.post(`/threads/${threadId}/end`, {})
+      onEnded?.(res.data)
+      setStatus('closed')
+      await loadFeedback()
+      if (voiceMode) endVoice()
+    } catch (err) {
+      console.error('❌ End session failed:', err)
+      alert('Failed to end session: ' + err.message)
+    } finally {
+      setEvaluating(false) // ⬅️ hide overlay
+    }
   }
 
   function downloadTranscript() {
-    console.log('📄 Downloading transcript...')
-    const lines = messages.map(m => {
-      const role = m.role === 'doctor' ? 'Doctor' : 'Patient'
-      const time = new Date(m.created_at).toLocaleTimeString()
-      return `[${time}] ${role}: ${m.content}`
-    })
-    
+    const lines = messages
+      .filter(m => !m.typing)
+      .map(m => {
+        const role = m.role === 'doctor' ? 'Doctor' : 'Patient'
+        const time = new Date(m.created_at).toLocaleTimeString()
+        return `[${time}] ${role}: ${m.content}`
+      })
     const header = `MediSim Transcript - ${title}\nGenerated: ${new Date().toLocaleString()}\n${'='.repeat(60)}\n\n`
     const content = header + lines.join('\n\n')
-    
     const blob = new Blob([content], { type: 'text/plain' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -272,28 +224,18 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
     a.click()
     a.remove()
     URL.revokeObjectURL(url)
-    
-    console.log('✅ Downloaded')
   }
 
   function startVoice() {
     if (!sttSupported || status === 'closed') return
-
-    console.log('🎙️ STARTING VOICE MODE')
     setVoiceMode(true)
     lastSpokenIdRef.current = null
-    
-    setTimeout(() => {
-      console.log('🎤 Starting mic with callback...')
-      start({ onFinalText: handleFinalText })
-    }, 300)
+    setTimeout(() => start({ onFinalText: handleFinalText }), 300)
   }
 
   function endVoice() {
-    console.log('🔇 ENDING VOICE MODE')
     setVoiceMode(false)
     stop()
-
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
@@ -324,7 +266,8 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
   }
 
   return (
-    <div className="flex-1 h-full flex flex-col">
+    // Make container relative so the overlay can absolutely cover it
+    <div className="flex-1 h-full flex flex-col relative">
       <div className="px-6 py-3 border-b border-slate-200 bg-white/70 backdrop-blur-sm flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <h2 className="text-sm font-semibold">{title}</h2>
@@ -372,15 +315,21 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
       </div>
 
       <div ref={scrollRef} className="flex-1 overflow-auto p-6 space-y-4">
-        {feedback && <div className="mb-4"><FeedbackCard data={feedback} /></div>}
         {messages.length === 0 && (
           <div className="text-center text-slate-400 mt-8">
             <p>No messages yet. Start speaking or typing!</p>
           </div>
         )}
         {messages.map((m) => (
-          <MessageBubble key={m.id} role={m.role} content={m.content} created_at={m.created_at} />
+          <MessageBubble
+            key={m.id}
+            role={m.role}
+            content={m.content}
+            created_at={m.created_at}
+            typing={m.typing}
+          />
         ))}
+        {feedback && <div className="mb-4"><FeedbackCard data={feedback} /></div>}
       </div>
 
       <div className="p-4 border-t border-slate-200 bg-white/70 backdrop-blur-sm">
@@ -410,6 +359,16 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
         </div>
       </div>
 
+      {/* ▶ Evaluating overlay */}
+      {evaluating && (
+        <div className="absolute inset-0 z-40 bg-white/70 backdrop-blur-sm flex items-center justify-center">
+          <div className="flex items-center gap-3 px-4 py-3 rounded-2xl border border-slate-200 bg-white shadow-soft">
+            <span className="inline-block w-4 h-4 rounded-full border-2 border-slate-300 border-t-slate-600 animate-spin" />
+            <span className="text-sm font-medium text-slate-700">Evaluating performance…</span>
+          </div>
+        </div>
+      )}
+
       {voiceMode && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-50">
           <div className="flex flex-col items-center gap-8">
@@ -421,9 +380,7 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
                   ? 'bg-gradient-to-br from-green-400 to-green-600 shadow-2xl shadow-green-500/50'
                   : 'bg-gradient-to-br from-gray-400 to-gray-600'
               }`}
-              style={{
-                transform: `scale(${1 + (listening ? level * 0.4 : 0)})`,
-              }}
+              style={{ transform: `scale(${1 + (listening ? level * 0.4 : 0)})` }}
             />
 
             {interim && !audioPlaying && (
@@ -470,7 +427,7 @@ export default function ChatArea({ threadId, meta, onEnded, onThreadEmptyNew }) 
   )
 }
 
-function MessageBubble({ role, content, created_at }) {
+function MessageBubble({ role, content, created_at, typing }) {
   const isDoctor = role === 'doctor'
   return (
     <div className={`flex ${isDoctor ? 'justify-end' : 'justify-start'}`}>
@@ -484,11 +441,28 @@ function MessageBubble({ role, content, created_at }) {
         <div className="text-xs opacity-70 mb-1">
           {isDoctor ? 'Doctor (You)' : 'Patient (AI)'}
         </div>
-        <div className="whitespace-pre-wrap leading-relaxed">{content}</div>
-        <div className="text-[10px] opacity-50 mt-1">
-          {new Date(created_at).toLocaleTimeString()}
-        </div>
+
+        {typing ? (
+          <TypingDots />
+        ) : (
+          <>
+            <div className="whitespace-pre-wrap leading-relaxed">{content}</div>
+            <div className="text-[10px] opacity-50 mt-1">
+              {new Date(created_at).toLocaleTimeString()}
+            </div>
+          </>
+        )}
       </div>
+    </div>
+  )
+}
+
+function TypingDots() {
+  return (
+    <div className="flex items-center gap-1 py-1">
+      <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce [animation-delay:-0.2s]"></span>
+      <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce"></span>
+      <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce [animation-delay:0.2s]"></span>
     </div>
   )
 }
